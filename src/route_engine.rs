@@ -1,5 +1,5 @@
 // ============================================================================
-// src/route_engine.rs — RouterFuel v0.6 — accurate as of July 24, 2026
+// src/route_engine.rs — RouterFuel v0.6 — accurate as of September 22, 2026
 //
 // Registry covers every major lab RouterFuel supports, direct + via OpenRouter:
 //   Anthropic, OpenAI, Google Gemini, xAI (Grok), DeepSeek (incl. open-weight),
@@ -469,13 +469,21 @@ impl RouteEngine {
     }
 
     /// Master registry — every model RouterFuel knows how to route to,
-    /// as of July 2026. Cost figures are USD cents per 1M tokens.
+    /// as of September 2026. Cost figures are USD cents per 1M tokens.
     fn build_registry() -> Vec<ModelConfig> {
         vec![
             // ================================================================
             // ANTHROPIC — POST https://api.anthropic.com/v1/messages
             // Headers: x-api-key, anthropic-version: 2023-06-01
             // ================================================================
+            // Released 2026-09-22. Anthropic publishes a 1M context window,
+            // 128K max output, image input, and $4/$20 per million tokens.
+            // Latency and quality remain RouterFuel routing estimates because
+            // Anthropic does not publish a comparable latency benchmark.
+            model!(api_id: "claude-opus-5-5", display_name: "Claude Opus 5.5", provider: Provider::Anthropic,
+                cost_in: 400.0, cost_out: 2000.0, latency_ms: 140, quality: 0.99, context: 1_000_000,
+                vision: true, open_weight: false, enabled: true),
+
             model!(api_id: "claude-opus-5", display_name: "Claude Opus 5", provider: Provider::Anthropic,
                 cost_in: 500.0, cost_out: 2500.0, latency_ms: 140, quality: 0.98, context: 1_000_000,
                 vision: true, open_weight: false, enabled: true),
@@ -570,6 +578,17 @@ impl RouteEngine {
                 cost_in: 1000.0, cost_out: 5000.0, latency_ms: 340, quality: 0.99, context: 1_050_000,
                 vision: true, open_weight: false, enabled: false,
                 tier: PriceTier { above_input_tokens: 272_000, input_mult: 2.0, output_mult: 1.5 }),
+
+            // OpenAI publishes 1.05M context windows, 128K max output, and
+            // image input for both models. Latency and quality are RouterFuel
+            // routing estimates; token prices are OpenAI's published rates.
+            model!(api_id: "gpt-6-sol", display_name: "GPT-6 Sol", provider: Provider::OpenAI,
+                cost_in: 200.0, cost_out: 1000.0, latency_ms: 250, quality: 0.98, context: 1_050_000,
+                vision: true, open_weight: false, enabled: true),
+
+            model!(api_id: "gpt-6-luna", display_name: "GPT-6 Luna", provider: Provider::OpenAI,
+                cost_in: 10.0, cost_out: 50.0, latency_ms: 100, quality: 0.82, context: 1_050_000,
+                vision: true, open_weight: false, enabled: true),
 
             model!(api_id: "gpt-5.6-sol", display_name: "GPT-5.6 Sol", provider: Provider::OpenAI,
                 cost_in: 500.0, cost_out: 3000.0, latency_ms: 250, quality: 0.99, context: 1_050_000,
@@ -703,6 +722,16 @@ impl RouteEngine {
             // described: no Grok has a larger window than 4.3/4.20's 1M, so
             // inputs above 1M no longer fall through to an "older Grok" —
             // they leave the xAI family entirely.
+            //
+            // Grok 4.7 keeps xAI's $2/$6 base rates and 500K window. xAI's
+            // model metadata publishes a separate $4 input rate above 200K;
+            // it publishes no long-context output rate, so output remains $6.
+            // Latency and quality are RouterFuel routing estimates.
+            model!(api_id: "grok-4.7", display_name: "Grok 4.7", provider: Provider::XAI,
+                cost_in: 200.0, cost_out: 600.0, latency_ms: 200, quality: 0.98, context: 500_000,
+                vision: true, open_weight: false, enabled: true,
+                tier: PriceTier { above_input_tokens: 200_000, input_mult: 2.0, output_mult: 1.0 }),
+
             model!(api_id: "grok-4.6", display_name: "Grok 4.6", provider: Provider::XAI,
                 cost_in: 200.0, cost_out: 600.0, latency_ms: 200, quality: 0.96, context: 500_000,
                 vision: true, open_weight: false, enabled: true),
@@ -1129,7 +1158,7 @@ impl RouteEngine {
             MeetingTask::Summarise          => (RoutingPriority::Balanced, "claude-sonnet-5"),
             MeetingTask::AnswerQuestion      => (RoutingPriority::Speed,    "gemini-3-flash-preview"),
             MeetingTask::ExtractActionItems  => (RoutingPriority::Cost,     "deepseek-v4-flash"),
-            MeetingTask::DraftResponse       => (RoutingPriority::Quality,  "claude-opus-5"),
+            MeetingTask::DraftResponse       => (RoutingPriority::Quality,  "claude-opus-5-5"),
             MeetingTask::Classify            => (RoutingPriority::Cost,     "gemini-3.1-flash-lite"),
         };
 
@@ -1439,7 +1468,7 @@ pub fn param_policy_for(api_id: &str) -> ParamPolicy {
         // is a reasoning model and the footnote is generic, but that is
         // inferred, not stated. Astra is disabled today, so this cannot
         // affect live traffic before someone verifies it with a key.
-        "gpt-6-astra" => ParamPolicy::OPENAI_REASONING,
+        "gpt-6-astra" | "gpt-6-sol" | "gpt-6-luna" => ParamPolicy::OPENAI_REASONING,
 
         "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna" => ParamPolicy::OPENAI_REASONING,
         "gpt-5.5" => ParamPolicy::OPENAI_REASONING,
@@ -1476,6 +1505,7 @@ mod tests {
     fn cost_does_not_pick_flagship_opus() {
         let e = RouteEngine::new();
         let d = e.select(5_000, 1_000, RoutingPriority::Cost).unwrap();
+        assert_ne!(d.model.api_id, "claude-opus-5-5");
         assert_ne!(d.model.api_id, "claude-opus-5");
     }
 
@@ -1496,6 +1526,7 @@ mod tests {
     #[test]
     fn find_opus_pricing() {
         let e = RouteEngine::new();
+        assert_eq!(e.get_pricing("claude-opus-5-5").unwrap(), (400.0, 2000.0));
         let (input, output) = e.get_pricing("claude-opus-5").unwrap();
         assert_eq!(input, 500.0);
         assert_eq!(output, 2500.0);
@@ -1520,6 +1551,7 @@ mod tests {
     #[test]
     fn vision_models_are_flagged() {
         let e = RouteEngine::new();
+        assert!(e.is_vision_capable("claude-opus-5-5"));
         assert!(e.is_vision_capable("claude-opus-5"));
         assert!(e.is_vision_capable("gpt-5.6-sol"));
         assert!(e.is_vision_capable("gemini-3.1-pro-preview"));
@@ -1613,6 +1645,48 @@ mod tests {
         assert_eq!(grok.provider, Provider::XAI);
         assert_eq!(grok.context_window, 500_000);
         assert_eq!(e.get_pricing("grok-4.6").unwrap(), (200.0, 600.0));
+    }
+
+    #[test]
+    fn opus_5_5_and_grok_4_7_are_registered_with_published_limits() {
+        let e = RouteEngine::new();
+
+        let opus = e.find("claude-opus-5-5").unwrap();
+        assert_eq!(opus.provider, Provider::Anthropic);
+        assert_eq!(opus.context_window, 1_000_000);
+        assert!(opus.supports_vision);
+        assert_eq!(e.get_pricing("claude-opus-5-5").unwrap(), (400.0, 2000.0));
+
+        let grok = e.find("grok-4.7").unwrap();
+        assert_eq!(grok.provider, Provider::XAI);
+        assert_eq!(grok.context_window, 500_000);
+        assert!(grok.supports_vision);
+        assert_eq!(e.get_pricing_for("grok-4.7", 200_000).unwrap(), (200.0, 600.0));
+        assert_eq!(e.get_pricing_for("grok-4.7", 200_001).unwrap(), (400.0, 600.0));
+    }
+
+    #[test]
+    fn gpt_6_sol_and_luna_are_registered_with_published_limits() {
+        let e = RouteEngine::new();
+
+        for (id, pricing) in [
+            ("gpt-6-sol", (200.0, 1000.0)),
+            ("gpt-6-luna", (10.0, 50.0)),
+        ] {
+            let model = e.find(id).unwrap_or_else(|_| panic!("{id} missing"));
+            assert_eq!(model.provider, Provider::OpenAI, "{id}");
+            assert_eq!(model.context_window, 1_050_000, "{id}");
+            assert!(model.supports_vision, "{id}");
+            assert_eq!(e.get_pricing(id).unwrap(), pricing, "{id}");
+            assert_eq!(param_policy_for(id), ParamPolicy::OPENAI_REASONING, "{id}");
+        }
+    }
+
+    #[test]
+    fn draft_response_prefers_opus_5_5() {
+        let e = RouteEngine::new();
+        let d = e.select_for_task(MeetingTask::DraftResponse, 5_000, None).unwrap();
+        assert_eq!(d.model.api_id, "claude-opus-5-5");
     }
 
     fn msg(role: &str, text: &str) -> crate::connectors::ChatMessage {
@@ -2094,6 +2168,7 @@ mod tests {
         // neither — the effect was admitting 1M-2M requests xAI rejects.
         let e = RouteEngine::new();
         let ctx = |id: &str| e.find(id).unwrap().context_window;
+        assert_eq!(ctx("grok-4.7"), 500_000);
         assert_eq!(ctx("grok-4.6"), 500_000);
         assert_eq!(ctx("grok-4.5"), 500_000);
         assert_eq!(ctx("grok-4.3"), 1_000_000);
