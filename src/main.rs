@@ -376,7 +376,7 @@ async fn handle_streaming(headers: HeaderMap, state: AppState, mut request: Chat
     let input_tokens = match sc_messages {
         Some(messages) => {
             request.messages = messages;
-            sc_report.compressed_tokens
+            tokens::count_completion_request_tokens(&request).unwrap_or(input_tokens)
         }
         None => input_tokens,
     };
@@ -456,7 +456,19 @@ fn resolve_model(
     keys: &ClientProviderKeys,
 ) -> Result<(Provider, String), ApiError> {
     let has_image = request.messages.iter().any(|m| m.content.has_image());
-    let reachable = reachable_providers(keys);
+    let mut reachable = reachable_providers(keys);
+    if connectors::has_tool_payload(request) && keys.openrouter.is_none() {
+        let tool_wire_providers = [
+            Provider::OpenAI, Provider::DeepSeek, Provider::Mistral, Provider::XAI,
+            Provider::Qwen, Provider::Moonshot, Provider::Zhipu, Provider::Groq,
+            Provider::AzureOpenAI,
+        ];
+        let allowed: HashSet<_> = tool_wire_providers.into_iter().collect();
+        match &mut reachable {
+            Some(providers) => providers.retain(|provider| allowed.contains(provider)),
+            None => reachable = Some(allowed),
+        }
+    }
 
     if request.model == "auto" {
         let decision = if has_image {
@@ -733,7 +745,7 @@ async fn handle_non_streaming(
     let input_tokens = match sc_messages {
         Some(messages) => {
             request.messages = messages;
-            sc_report.compressed_tokens
+            tokens::count_completion_request_tokens(&request).unwrap_or(input_tokens)
         }
         None => input_tokens,
     };
