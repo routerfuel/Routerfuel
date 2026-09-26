@@ -2,6 +2,8 @@
 
 Status: implementation in progress on `feat/voice-agent-foundation`. This file is a contract for the remaining slices, not a claim that they already ship.
 
+Tenant choice: one stable `organization_id` owns multiple client key hashes. Migration 011 adds the mapping and authentication resolves it; migration 012 snapshots it on request logs. Existing and env-only keys initially use their own hash as the organization ID. Provisioning must explicitly assign the same organization ID to rotated or additional keys. If an existing key is regrouped later, its older request logs retain their original snapshot; operators must explicitly migrate historical rows if they intend a retrospective report. MCP permissions must use the authenticated organization ID, never a user-supplied header or display name.
+
 ## Product boundary
 
 RouterFuel routes and measures model, speech, and tool traffic for a customer's voice agent. The customer's telephony or agent runtime owns the call and playback. RouterFuel must not claim to orchestrate calls, barge-in, or turn taking until those behaviors have been tested with a real runtime.
