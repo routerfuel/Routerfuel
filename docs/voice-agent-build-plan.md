@@ -24,6 +24,8 @@ The deployment must remain self hosted and BYOK. Every billable provider request
 
 ### 1. Tool correctness
 
+Follow-up (separate PR): verify and implement Anthropic's equivalent of OpenAI `strict: true` tool schemas. The ordinary Anthropic translation path must reject `strict: true` explicitly until then. Streaming tool calls on the OpenAI-shaped Anthropic connector also remain rejected until a tested SSE translation ships.
+
 - Preserve OpenAI tool definitions, assistant tool calls, tool results, and null assistant content for OpenAI-compatible providers. Preserve streaming tool-call deltas byte for byte.
 - Translate tools for Anthropic, Gemini, and Vertex only with provider-specific round-trip tests. Until then reject unsupported combinations before calling a provider.
 - Route `auto` and task requests only to tool-compatible connectors. Record the resolved provider and model.
