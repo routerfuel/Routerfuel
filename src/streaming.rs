@@ -54,24 +54,6 @@ struct OpenAiStreamUsage {
 }
 
 #[derive(Debug, Deserialize)]
-struct AnthropicStreamEvent {
-    #[serde(rename = "type")]
-    event_type: String,
-    delta: Option<AnthropicStreamDelta>,
-    usage: Option<AnthropicStreamUsage>,
-}
-
-#[derive(Debug, Deserialize)]
-struct AnthropicStreamDelta {
-    text: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct AnthropicStreamUsage {
-    output_tokens: Option<u32>,
-}
-
-#[derive(Debug, Deserialize)]
 struct GeminiStreamChunk {
     candidates: Option<Vec<GeminiStreamCandidate>>,
     #[serde(rename = "usageMetadata")]
@@ -122,7 +104,7 @@ pub async fn stream_handler(
     rl_key: String,
     estimated_cost_cents: f64,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ConnectorError> {
-    if matches!(provider, Provider::Anthropic | Provider::Gemini | Provider::VertexAI)
+    if matches!(provider, Provider::Gemini | Provider::VertexAI)
         && crate::connectors::has_tool_payload(&req)
     {
         return Err(ConnectorError::BadResponse(
@@ -211,15 +193,7 @@ pub async fn stream_handler(
 
     let (url, body): (String, serde_json::Value) = match provider {
         Provider::Anthropic => {
-            let mut body = serde_json::json!({
-                "model": req.model,
-                "messages": req.messages,
-                "max_tokens": req.max_tokens.unwrap_or(1024),
-                "stream": true,
-            });
-            if let Some(t) = req.temperature {
-                body["temperature"] = serde_json::json!(t);
-            }
+            let body = crate::connectors::anthropic_stream_body(&req)?;
             (provider_base_url(Provider::Anthropic).to_string(), body)
         }
         Provider::Gemini => {
@@ -378,6 +352,8 @@ pub async fn stream_handler(
         let mut input_tokens = 0u32;
         let mut output_tokens = 0u32;
         let mut chunk_count = 0u32;
+        let mut anthropic_framer = crate::anthropic_stream::SseFramer::default();
+        let mut anthropic_translator = crate::anthropic_stream::Translator::default();
 
         while let Some(chunk) = byte_stream.next().await {
             let bytes = match chunk {
@@ -387,6 +363,44 @@ pub async fn stream_handler(
                     break;
                 }
             };
+
+            if is_anthropic {
+                let frames = match anthropic_framer.push(&bytes) {
+                    Ok(frames) => frames,
+                    Err(message) => {
+                        error!(%message, "Anthropic SSE framing failed");
+                        yield Event::default().data(serde_json::json!({"error":message}).to_string());
+                        break;
+                    }
+                };
+                let mut failed = false;
+                for data in frames {
+                    let translated = match anthropic_translator.translate(&data) {
+                        Ok(translated) => translated,
+                        Err(message) => {
+                            error!(%message, "Anthropic SSE translation failed");
+                            yield Event::default().data(serde_json::json!({"error":message}).to_string());
+                            failed = true;
+                            break;
+                        }
+                    };
+                    input_tokens = anthropic_translator.input_tokens;
+                    output_tokens = anthropic_translator.output_tokens;
+                    for item in translated.chunks {
+                        yield Event::default().data(item.to_string());
+                    }
+                    if translated.done {
+                        let _ = audit_tx.send(AuditPayload {
+                            provider, input_tokens, output_tokens,
+                            total_latency_ms: start.elapsed().as_millis() as u64, ttfb_ms,
+                        }).await;
+                        yield Event::default().data("[DONE]");
+                        return;
+                    }
+                }
+                if failed { break; }
+                continue;
+            }
 
             let text = match String::from_utf8(bytes.to_vec()) {
                 Ok(t) => t,
@@ -413,30 +427,7 @@ pub async fn stream_handler(
                     return;
                 }
 
-                if is_anthropic {
-                    if let Ok(event) = serde_json::from_str::<AnthropicStreamEvent>(data) {
-                        if let Some(delta) = &event.delta {
-                            if let Some(t) = &delta.text {
-                                full_text.push_str(t);
-                                chunk_count += 1;
-                            }
-                        }
-                        if let Some(usage) = &event.usage {
-                            if let Some(ot) = usage.output_tokens { output_tokens = ot; }
-                        }
-                        if event.event_type == "message_stop" {
-                            debug!(chunks = chunk_count, "Anthropic stream complete");
-                            let _ = audit_tx.send(AuditPayload {
-                                provider, input_tokens, output_tokens,
-                                total_latency_ms: start.elapsed().as_millis() as u64,
-                                ttfb_ms,
-                            }).await;
-                            yield Event::default().data("[DONE]");
-                            return;
-                        }
-                    }
-                    yield Event::default().data(data);
-                } else if is_gemini || is_vertex {
+                if is_gemini || is_vertex {
                     if let Ok(chunk) = serde_json::from_str::<GeminiStreamChunk>(data) {
                         if let Some(candidates) = &chunk.candidates {
                             for c in candidates {
@@ -505,6 +496,11 @@ pub async fn stream_handler(
             total_latency_ms: start.elapsed().as_millis() as u64,
             ttfb_ms,
         }).await;
+        if is_anthropic {
+            let message = if anthropic_framer.is_empty() { "Anthropic stream ended without message_stop" }
+                else { "Anthropic stream ended with an incomplete SSE frame" };
+            yield Event::default().data(serde_json::json!({"error":message}).to_string());
+        }
     };
 
     Ok(Sse::new(stream).keep_alive(
