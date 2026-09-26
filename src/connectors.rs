@@ -483,6 +483,21 @@ pub(crate) fn validate_anthropic_tool_request(req: &ChatCompletionRequest) -> Re
     anthropic_tool_request(req).map(|_| ()).map_err(|error| error.to_string())
 }
 
+pub(crate) fn anthropic_stream_body(req: &ChatCompletionRequest) -> Result<serde_json::Value, ConnectorError> {
+    let mut body = serde_json::to_value(anthropic_tool_request(req)?)?;
+    body["stream"] = serde_json::Value::Bool(true);
+    Ok(body)
+}
+
+pub(crate) fn anthropic_finish_reason(stop_reason: &str, has_tools: bool) -> Result<&'static str, ConnectorError> {
+    match stop_reason {
+        "tool_use" if has_tools => Ok("tool_calls"),
+        "end_turn" | "stop_sequence" if !has_tools => Ok("stop"),
+        "max_tokens" if !has_tools => Ok("length"),
+        other => Err(ConnectorError::BadResponse(format!("Anthropic stop reason and tool blocks disagree: {other}"))),
+    }
+}
+
 pub fn build_anthropic_messages(messages: &[ChatMessage]) -> (Vec<serde_json::Value>, Option<String>) {
     let mut system_text = String::new();
     let mut out = Vec::with_capacity(messages.len());
@@ -543,12 +558,7 @@ fn map_anthropic_response(ar: AnthropicResp) -> Result<ChatCompletionResponse, C
             other => return Err(ConnectorError::BadResponse(format!("Unsupported Anthropic content block: {other}"))),
         }
     }
-    let finish_reason = match ar.stop_reason.as_str() {
-        "tool_use" if !tool_calls.is_empty() => "tool_calls",
-        "end_turn" | "stop_sequence" if tool_calls.is_empty() => "stop",
-        "max_tokens" if tool_calls.is_empty() => "length",
-        other => return Err(ConnectorError::BadResponse(format!("Anthropic stop reason and tool blocks disagree: {other}"))),
-    };
+    let finish_reason = anthropic_finish_reason(&ar.stop_reason, !tool_calls.is_empty())?;
     let content = if text_blocks.is_empty() && !tool_calls.is_empty() {
         crate::vision::MessageContent::Null
     } else {
