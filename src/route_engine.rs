@@ -1693,6 +1693,9 @@ mod tests {
         crate::connectors::ChatMessage {
             role: role.to_string(),
             content: crate::vision::MessageContent::Text(text.to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
         }
     }
 

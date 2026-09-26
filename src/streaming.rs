@@ -17,7 +17,7 @@ use crate::concurrency::ConcurrencyLimiter;
 use crate::connectors::{provider_base_url, to_gemini_body, ChatCompletionRequest, ConnectorError, ConnectorManager, Provider};
 use crate::cost_tracker::CostTracker;
 use crate::guardrails::SpendGuard;
-use crate::route_engine::{OutputTokenField, RouteEngine};
+use crate::route_engine::RouteEngine;
 use crate::tokens::TokenCostBreakdown;
 use async_stream::try_stream;
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -28,7 +28,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio_stream::Stream;
-use tracing::{debug, error, instrument, warn};
+use tracing::{debug, error, instrument};
 
 // SSE chunk types
 #[derive(Debug, Deserialize)]
@@ -122,6 +122,13 @@ pub async fn stream_handler(
     rl_key: String,
     estimated_cost_cents: f64,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ConnectorError> {
+    if matches!(provider, Provider::Anthropic | Provider::Gemini | Provider::VertexAI)
+        && crate::connectors::has_tool_payload(&req)
+    {
+        return Err(ConnectorError::BadResponse(
+            "OpenAI-format tools are not yet supported on this provider connector".into(),
+        ));
+    }
     let start = Instant::now();
 
     let (audit_tx, mut audit_rx) = mpsc::channel::<AuditPayload>(1);
@@ -271,44 +278,11 @@ pub async fn stream_handler(
         // OpenAI, DeepSeek, Mistral, xAI, Qwen, Moonshot, Zhipu,
         // OpenRouter — everything OpenAI-compatible.
         //
-        // Note this serialises ChatCompletionRequest directly instead of
-        // calling connectors::build_openai_compatible_body, so it is a second
-        // body builder that has to repeat the same parameter filtering. That
-        // divergence is exactly why the max_tokens defect survived on the
-        // streaming path; consolidating the two is tracked separately.
+        // Use the same wire body as non-streaming requests. This preserves
+        // tool calls and keeps reasoning-model parameter filtering aligned.
         _ => {
-            let mut body = serde_json::to_value(&req).unwrap_or_default();
+            let mut body = crate::connectors::build_openai_compatible_body(&req);
             body["stream"] = serde_json::Value::Bool(true);
-
-            // Same restrictions as the non-streaming path — see
-            // route_engine::param_policy_for. serde emits whatever the client
-            // sent, so the fields have to be removed after the fact here
-            // rather than skipped during assembly.
-            let policy = crate::route_engine::param_policy_for(&req.model);
-            if let Some(obj) = body.as_object_mut() {
-                if policy.drop_temperature && obj.remove("temperature").is_some() {
-                    warn!(
-                        model = %req.model,
-                        "dropping client-supplied `temperature`: this model rejects it. \
-                         The request proceeds at the model's own default sampling."
-                    );
-                }
-                if policy.drop_top_p && obj.remove("top_p").is_some() {
-                    warn!(
-                        model = %req.model,
-                        "dropping client-supplied `top_p`: this model rejects it. \
-                         The request proceeds at the model's own default sampling."
-                    );
-                }
-                // A rename, not a drop, so no warning — but a hard 400 from
-                // OpenAI's reasoning models if left as `max_tokens`.
-                if policy.output_token_field == OutputTokenField::MaxCompletionTokens {
-                    if let Some(mt) = obj.remove("max_tokens") {
-                        obj.insert("max_completion_tokens".to_string(), mt);
-                    }
-                }
-            }
-
             (provider_base_url(provider).to_string(), body)
         }
     };

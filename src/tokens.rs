@@ -90,6 +90,12 @@ pub fn count_request_tokens(
         total = total.saturating_add(
             count_message_tokens(&msg.role, &msg.content.as_text())?
         );
+        if let Some(calls) = &msg.tool_calls {
+            total = total.saturating_add(count_tokens(&serde_json::to_string(calls).unwrap_or_default())?);
+        }
+        if let Some(id) = &msg.tool_call_id {
+            total = total.saturating_add(count_tokens(id)?);
+        }
     }
 
     debug!(
@@ -98,6 +104,19 @@ pub fn count_request_tokens(
         "Counted request tokens"
     );
 
+    Ok(total)
+}
+
+pub fn count_completion_request_tokens(
+    request: &crate::connectors::ChatCompletionRequest,
+) -> Result<u32, TokenError> {
+    let mut total = count_request_tokens(&request.messages, &request.model)?;
+    if let Some(tools) = &request.tools {
+        total = total.saturating_add(count_tokens(&serde_json::to_string(tools).unwrap_or_default())?);
+    }
+    if let Some(choice) = &request.tool_choice {
+        total = total.saturating_add(count_tokens(&choice.to_string())?);
+    }
     Ok(total)
 }
 
@@ -159,6 +178,22 @@ impl TokenCostBreakdown {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_schema_and_calls_are_counted_for_spend_reservation() {
+        let plain: crate::connectors::ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "gpt-6-sol", "messages": [{"role":"user","content":"Book a slot"}]
+        })).unwrap();
+        let mut agent = plain.clone();
+        agent.tools = Some(vec![serde_json::json!({
+            "type":"function", "function":{"name":"book_appointment", "description":"Reserve the requested appointment slot"}
+        })]);
+        agent.messages.push(serde_json::from_value(serde_json::json!({
+            "role":"assistant", "content":null,
+            "tool_calls":[{"id":"call_1","type":"function","function":{"name":"book_appointment","arguments":"{\"slot\":\"noon\"}"}}]
+        })).unwrap());
+        assert!(count_completion_request_tokens(&agent).unwrap() > count_completion_request_tokens(&plain).unwrap());
+    }
 
     #[test] fn counts_simple_string() {
         let n = count_tokens("Hello world").unwrap();
