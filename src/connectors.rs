@@ -186,7 +186,7 @@ pub fn has_tool_payload(req: &ChatCompletionRequest) -> bool {
     req.tools.is_some()
         || req.tool_choice.is_some()
         || req.parallel_tool_calls.is_some()
-        || req.messages.iter().any(|m| m.tool_calls.is_some() || m.tool_call_id.is_some() || m.role == "tool")
+        || req.messages.iter().any(|m| m.tool_calls.is_some() || m.tool_call_id.is_some() || m.name.is_some() || m.role == "tool")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

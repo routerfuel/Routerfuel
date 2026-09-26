@@ -271,6 +271,8 @@ fn cacheable_chat_request(request: &ChatCompletionRequest) -> bool {
         && request.temperature.is_none()
         && request.top_p.is_none()
         && request.max_tokens.is_none()
+        && request.shadow_model.is_none()
+        && request.supercompress.is_none()
         && request.messages[0].tool_calls.is_none()
         && request.messages[0].tool_call_id.is_none()
         && request.messages[0].name.is_none()
