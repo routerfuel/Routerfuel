@@ -163,7 +163,17 @@ fn extract_header_string(headers: &HeaderMap, key: &str) -> Option<String> {
 #[derive(Debug, Clone)]
 pub struct DbKeyRecord {
     pub client_name: String,
+    pub organization_id: String,
     pub active: bool,
+}
+
+/// Authenticated identity. Key-scoped limits continue to use `client_hash`;
+/// tenant-scoped reporting and permissions must use `organization_id`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientIdentity {
+    pub client_hash: String,
+    pub client_name: String,
+    pub organization_id: String,
 }
 
 pub struct ApiKeyStore {
@@ -240,6 +250,11 @@ impl ApiKeyStore {
     /// order note at the top of this file); the env layer answers only for
     /// keys the DB has never heard of.
     pub fn validate(&self, raw_key: &str) -> Option<(String, String)> {
+        self.validate_identity(raw_key)
+            .map(|identity| (identity.client_hash, identity.client_name))
+    }
+
+    pub fn validate_identity(&self, raw_key: &str) -> Option<ClientIdentity> {
         let hash = sha256_hex(raw_key);
 
         // DB layer first — this is the authoritative one.
@@ -258,14 +273,23 @@ impl ApiKeyStore {
                 }
                 return None;
             }
-            return Some((hash, record.client_name.clone()));
+            return Some(ClientIdentity {
+                client_hash: hash,
+                client_name: record.client_name.clone(),
+                organization_id: record.organization_id.clone(),
+            });
         }
 
         // Fallback: env layer. Keeps ROUTERFUEL_API_KEYS working standalone,
         // and keeps those keys working if the DB sync has never succeeded.
         self.env_keys
             .get(&hash)
-            .map(|name| (hash.clone(), name.clone()))
+            .map(|name| ClientIdentity {
+                client_hash: hash.clone(),
+                client_name: name.clone(),
+                // Env-only keys have no provisioned organization mapping.
+                organization_id: hash.clone(),
+            })
     }
 
     /// Number of keys in the env layer. The DB layer is reported separately
@@ -332,8 +356,9 @@ pub async fn api_key_middleware(
     };
 
     // Validate against the store (DB layer first, env layer as fallback)
-    match store.validate(&raw_key) {
-        Some((client_hash, client_name)) => {
+    match store.validate_identity(&raw_key) {
+        Some(identity) => {
+            let ClientIdentity { client_hash, client_name, organization_id } = identity;
             debug!(client = %client_name, client_hash = &client_hash[..8], "API key validated");
 
             // FIX: inject the HASH, not the display name — this is what
@@ -346,6 +371,13 @@ pub async fn api_key_middleware(
                 "x-routerfuel-client-id",
                 client_hash.parse().expect("sha256 hex digest is always valid header text"),
             );
+            // Remove any caller-supplied value before injecting the trusted ID.
+            request.headers_mut().remove("x-routerfuel-organization-id");
+            request.extensions_mut().insert(ClientIdentity {
+                client_hash,
+                client_name,
+                organization_id,
+            });
 
             next.run(request).await
         }
@@ -444,8 +476,30 @@ mod tests {
     fn db_record(name: &str, active: bool) -> DbKeyRecord {
         DbKeyRecord {
             client_name: name.to_string(),
+            organization_id: "org_test".to_string(),
             active,
         }
+    }
+
+    #[test]
+    fn two_keys_share_stable_organization_across_rotation() {
+        let store = ApiKeyStore::from_env_string("");
+        let first = sha256_hex("old-key");
+        let second = sha256_hex("new-key");
+        store.replace_db_keys(HashMap::from([
+            (first.clone(), db_record("Acme", true)),
+            (second.clone(), db_record("Acme", true)),
+        ]));
+        let old = store.validate_identity("old-key").unwrap();
+        let new = store.validate_identity("new-key").unwrap();
+        assert_ne!(old.client_hash, new.client_hash);
+        assert_eq!(old.organization_id, new.organization_id);
+        store.replace_db_keys(HashMap::from([
+            (first, db_record("Acme", false)),
+            (second, db_record("Acme", true)),
+        ]));
+        assert!(store.validate_identity("old-key").is_none());
+        assert_eq!(store.validate_identity("new-key").unwrap().organization_id, "org_test");
     }
 
     #[test]

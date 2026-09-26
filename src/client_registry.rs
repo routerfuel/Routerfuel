@@ -135,8 +135,8 @@ pub async fn sync_clients_from_db(
     // Inactive rows are fetched too, not filtered out in SQL: ApiKeyStore
     // needs them to shadow the env layer so `active = false` is a real
     // revocation even for a key also listed in ROUTERFUEL_API_KEYS.
-    let rows = sqlx::query_as::<_, (String, String, String, bool)>(
-        "SELECT client_id, client_name, tier, active FROM client_tiers"
+    let rows = sqlx::query_as::<_, (String, String, String, bool, String)>(
+        "SELECT client_id, client_name, tier, active, organization_id FROM client_tiers"
     )
     .fetch_all(pool)
     .await?;
@@ -144,7 +144,7 @@ pub async fn sync_clients_from_db(
     let mut stats = SyncStats::default();
     let mut snapshot: HashMap<String, DbKeyRecord> = HashMap::with_capacity(rows.len());
 
-    for (client_id, client_name, tier_str, active) in rows {
+    for (client_id, client_name, tier_str, active, organization_id) in rows {
         if active {
             let tier = parse_tier(&tier_str);
 
@@ -172,7 +172,7 @@ pub async fn sync_clients_from_db(
 
         // The tier isn't kept in the snapshot — it was applied to the
         // RateLimiter above, which is what the request path reads.
-        snapshot.insert(client_id, DbKeyRecord { client_name, active });
+        snapshot.insert(client_id, DbKeyRecord { client_name, organization_id, active });
     }
 
     // Swapped in only on success — a failed query above returns early and
