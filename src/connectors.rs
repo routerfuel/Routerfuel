@@ -160,6 +160,12 @@ pub struct ChatCompletionRequest {
     pub top_p: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<serde_json::Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel_tool_calls: Option<bool>,
     /// RouterFuel-only field, never forwarded to a provider (see `skip_serializing`
     /// below) — if set, RouterFuel fires an identical request at this model
     /// *in addition to* the normally-routed one, purely for comparison. The
@@ -176,6 +182,13 @@ pub struct ChatCompletionRequest {
     pub supercompress: Option<crate::supercompress::SupercompressOptions>,
 }
 
+pub fn has_tool_payload(req: &ChatCompletionRequest) -> bool {
+    req.tools.is_some()
+        || req.tool_choice.is_some()
+        || req.parallel_tool_calls.is_some()
+        || req.messages.iter().any(|m| m.tool_calls.is_some() || m.tool_call_id.is_some() || m.name.is_some() || m.role == "tool")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
@@ -183,6 +196,12 @@ pub struct ChatMessage {
     /// client sending a bare string) or multimodal parts carrying one or
     /// more images alongside text — see src/vision.rs.
     pub content: crate::vision::MessageContent,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<serde_json::Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -407,6 +426,11 @@ impl Connector for AnthropicConnector {
         req: &ChatCompletionRequest,
         client_api_key: &str,
     ) -> Result<ConnectorResult, ConnectorError> {
+        if has_tool_payload(req) {
+            return Err(ConnectorError::BadResponse(
+                "OpenAI-format tools are not yet supported on the Anthropic connector; use /v1/messages".into(),
+            ));
+        }
         let start = Instant::now();
 
         if self.circuit_breaker.is_open(Provider::Anthropic) {
@@ -476,6 +500,9 @@ impl Connector for AnthropicConnector {
                         message: ChatMessage {
                             role: "assistant".into(),
                             content: crate::vision::MessageContent::Text(content),
+                            tool_calls: None,
+                            tool_call_id: None,
+                            name: None,
                         },
                         finish_reason: ar.stop_reason,
                     }],
@@ -604,6 +631,11 @@ impl Connector for GeminiConnector {
         req: &ChatCompletionRequest,
         client_api_key: &str,
     ) -> Result<ConnectorResult, ConnectorError> {
+        if has_tool_payload(req) {
+            return Err(ConnectorError::BadResponse(
+                "OpenAI-format tools are not yet supported on the Gemini connector".into(),
+            ));
+        }
         let start = Instant::now();
 
         if self.circuit_breaker.is_open(Provider::Gemini) {
@@ -688,6 +720,9 @@ impl Connector for GeminiConnector {
                         message: ChatMessage {
                             role: "assistant".into(),
                             content: crate::vision::MessageContent::Text(content),
+                            tool_calls: None,
+                            tool_call_id: None,
+                            name: None,
                         },
                         finish_reason,
                     }],
@@ -1064,7 +1099,11 @@ pub fn build_openai_compatible_body(req: &ChatCompletionRequest) -> serde_json::
         .iter()
         .map(|m| {
             let mm = crate::vision::MultimodalMessage { role: m.role.clone(), content: m.content.clone() };
-            crate::vision::to_openai_compatible_content(&mm)
+            let mut value = crate::vision::to_openai_compatible_content(&mm);
+            if let Some(tool_calls) = &m.tool_calls { value["tool_calls"] = serde_json::json!(tool_calls); }
+            if let Some(tool_call_id) = &m.tool_call_id { value["tool_call_id"] = serde_json::json!(tool_call_id); }
+            if let Some(name) = &m.name { value["name"] = serde_json::json!(name); }
+            value
         })
         .collect();
 
@@ -1072,6 +1111,9 @@ pub fn build_openai_compatible_body(req: &ChatCompletionRequest) -> serde_json::
         "model": req.model,
         "messages": messages,
     });
+    if let Some(tools) = &req.tools { body["tools"] = serde_json::json!(tools); }
+    if let Some(choice) = &req.tool_choice { body["tool_choice"] = choice.clone(); }
+    if let Some(parallel) = req.parallel_tool_calls { body["parallel_tool_calls"] = serde_json::json!(parallel); }
 
     // Some models reject fields the rest of the ecosystem accepts, with a
     // 400 rather than by ignoring them — so forwarding a client's request
@@ -1232,6 +1274,9 @@ mod tests {
             messages: vec![ChatMessage {
                 role: "user".into(),
                 content: MessageContent::Text("hi".into()),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
             }],
             // Binary-exact so the assertions can compare equal: an f32 like
             // 0.7 widens to 0.699999988079071 as JSON f64.
@@ -1239,9 +1284,74 @@ mod tests {
             max_tokens: Some(256),
             top_p: Some(0.75),
             stream: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
             shadow_model: None,
             supercompress: None,
         }
+    }
+
+    #[test]
+    fn tool_turn_round_trips_through_openai_body_and_response() {
+        let mut request = req("gpt-6-sol");
+        request.tools = Some(vec![serde_json::json!({
+            "type": "function", "function": {"name": "book", "parameters": {"type": "object"}}
+        })]);
+        request.tool_choice = Some(serde_json::json!("auto"));
+        request.messages.push(serde_json::from_value(serde_json::json!({
+            "role": "assistant", "content": null,
+            "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "book", "arguments": "{\"slot\":\"noon\"}"}}]
+        })).unwrap());
+        request.messages.push(serde_json::from_value(serde_json::json!({
+            "role": "tool", "tool_call_id": "call_1", "content": "confirmed"
+        })).unwrap());
+
+        let body = build_openai_compatible_body(&request);
+        assert_eq!(body["tools"][0]["function"]["name"], "book");
+        assert_eq!(body["messages"][1]["content"], serde_json::Value::Null);
+        assert_eq!(body["messages"][1]["tool_calls"][0]["id"], "call_1");
+        assert_eq!(body["messages"][2]["tool_call_id"], "call_1");
+
+        let response: ChatCompletionResponse = serde_json::from_value(serde_json::json!({
+            "model": "gpt-6-sol", "choices": [{"message": body["messages"][1], "finish_reason": "tool_calls"}],
+            "usage": {"prompt_tokens": 20, "completion_tokens": 10, "total_tokens": 30}
+        })).unwrap();
+        assert_eq!(serde_json::to_value(&response).unwrap()["choices"][0]["message"]["tool_calls"][0]["id"], "call_1");
+    }
+
+    #[tokio::test]
+    async fn tool_request_survives_an_http_provider_round_trip() {
+        use axum::{routing::post, Json, Router};
+        use parking_lot::Mutex;
+
+        let seen = Arc::new(Mutex::new(None::<serde_json::Value>));
+        let capture = Arc::clone(&seen);
+        let app = Router::new().route("/chat", post(move |Json(body): Json<serde_json::Value>| {
+            let capture = Arc::clone(&capture);
+            async move {
+                *capture.lock() = Some(body);
+                Json(serde_json::json!({
+                    "model": "gpt-6-sol",
+                    "choices": [{"message": {"role": "assistant", "content": null,
+                        "tool_calls": [{"id":"call_2","type":"function","function":{"name":"book","arguments":"{}"}}]},
+                        "finish_reason": "tool_calls"}],
+                    "usage": {"prompt_tokens": 50, "completion_tokens": 12, "total_tokens": 62}
+                }))
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+
+        let mut request = req("gpt-6-sol");
+        request.tools = Some(vec![serde_json::json!({"type":"function","function":{"name":"book","parameters":{"type":"object"}}})]);
+        let result = openai_compatible_call(
+            &reqwest::Client::new(), &format!("http://{address}/chat"), "local-test-key",
+            &request, Provider::OpenAI, &CircuitBreaker::new(), &[],
+        ).await.unwrap();
+        assert_eq!(seen.lock().as_ref().unwrap()["tools"][0]["function"]["name"], "book");
+        assert_eq!(result.response.choices[0].message.tool_calls.as_ref().unwrap()[0]["id"], "call_2");
     }
 
     #[test]

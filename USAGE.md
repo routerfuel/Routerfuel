@@ -73,6 +73,14 @@ The `model` field accepts three forms:
 
 ### Sending images (vision)
 
+### Tool calls
+
+OpenAI-format tool definitions and tool turns are forwarded through OpenAI-compatible providers. An assistant message may have `"content": null` alongside `tool_calls`; send the next message with `"role": "tool"` and the matching `tool_call_id`. Tool requests and conversation histories bypass semantic caching.
+
+The Anthropic native `/v1/messages` path preserves Anthropic tool use without translating it. The Anthropic, Gemini, Vertex AI, and Bedrock chat connectors do not yet translate OpenAI-format tools and return a client error for them. `"auto"` and `"task:..."` route tool requests only to compatible connectors unless an OpenRouter key is supplied.
+
+### Sending images (vision)
+
 Use `content` as an array of parts instead of a plain string:
 
 ```json

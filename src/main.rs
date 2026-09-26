@@ -257,6 +257,38 @@ fn reachable_providers(keys: &ClientProviderKeys) -> Option<HashSet<Provider>> {
 // CHAT COMPLETIONS — TOP-LEVEL DISPATCH (streaming vs. non-streaming)
 // ============================================================================
 
+fn cacheable_chat_request(request: &ChatCompletionRequest) -> bool {
+    // The cache key currently contains only model + last user text. Restrict
+    // it to the only request shape that key fully describes. In particular,
+    // never replay a prior answer for a different system prompt, conversation
+    // history, tool schema/result, or sampling setting.
+    request.messages.len() == 1
+        && request.messages[0].role == "user"
+        && matches!(request.messages[0].content, vision::MessageContent::Text(_))
+        && request.tools.is_none()
+        && request.tool_choice.is_none()
+        && request.parallel_tool_calls.is_none()
+        && request.temperature.is_none()
+        && request.top_p.is_none()
+        && request.max_tokens.is_none()
+        && request.shadow_model.is_none()
+        && request.supercompress.is_none()
+        && request.messages[0].tool_calls.is_none()
+        && request.messages[0].tool_call_id.is_none()
+        && request.messages[0].name.is_none()
+}
+
+fn validate_tool_wire(request: &ChatCompletionRequest, provider: Provider) -> Result<(), ApiError> {
+    if connectors::has_tool_payload(request)
+        && matches!(provider, Provider::Anthropic | Provider::Gemini | Provider::VertexAI | Provider::Bedrock)
+    {
+        return Err(ApiError::BadRequest(format!(
+            "OpenAI-format tool calls are not supported by the {provider} connector. Use an OpenAI-compatible provider or Anthropic's native /v1/messages endpoint."
+        )));
+    }
+    Ok(())
+}
+
 async fn chat_completions_handler(
     headers: HeaderMap,
     State(state): State<AppState>,
@@ -301,7 +333,7 @@ async fn handle_streaming(headers: HeaderMap, state: AppState, mut request: Chat
     // filter to what this client can actually reach.
     let provider_keys = ClientProviderKeys::from_headers(&headers);
 
-    let input_tokens = tokens::count_request_tokens(&request.messages, &request.model)
+    let input_tokens = tokens::count_completion_request_tokens(&request)
         .unwrap_or(0);
 
     let (selected_provider, routing_model_id) = match resolve_model(&state, &request, input_tokens, &provider_keys) {
@@ -346,7 +378,7 @@ async fn handle_streaming(headers: HeaderMap, state: AppState, mut request: Chat
     let input_tokens = match sc_messages {
         Some(messages) => {
             request.messages = messages;
-            sc_report.compressed_tokens
+            tokens::count_completion_request_tokens(&request).unwrap_or(input_tokens)
         }
         None => input_tokens,
     };
@@ -375,6 +407,11 @@ async fn handle_streaming(headers: HeaderMap, state: AppState, mut request: Chat
             return e.into_response();
         }
     };
+
+    if let Err(e) = validate_tool_wire(&request, byok.provider_to_call) {
+        state.spend_guard.release(&rl_key, estimated_cost.total_cost_cents);
+        return e.into_response();
+    }
 
     let mut effective_request = request.clone();
     effective_request.model = byok.model_id_to_send.clone();
@@ -421,7 +458,19 @@ fn resolve_model(
     keys: &ClientProviderKeys,
 ) -> Result<(Provider, String), ApiError> {
     let has_image = request.messages.iter().any(|m| m.content.has_image());
-    let reachable = reachable_providers(keys);
+    let mut reachable = reachable_providers(keys);
+    if connectors::has_tool_payload(request) && keys.openrouter.is_none() {
+        let tool_wire_providers = [
+            Provider::OpenAI, Provider::DeepSeek, Provider::Mistral, Provider::XAI,
+            Provider::Qwen, Provider::Moonshot, Provider::Zhipu, Provider::Groq,
+            Provider::AzureOpenAI,
+        ];
+        let allowed: HashSet<_> = tool_wire_providers.into_iter().collect();
+        match &mut reachable {
+            Some(providers) => providers.retain(|provider| allowed.contains(provider)),
+            None => reachable = Some(allowed),
+        }
+    }
 
     if request.model == "auto" {
         let decision = if has_image {
@@ -552,7 +601,7 @@ async fn handle_non_streaming(
         return Err(ApiError::LoopDetected);
     }
 
-    if !prompt_text.is_empty() {
+    if cacheable_chat_request(&request) && !prompt_text.is_empty() {
        if let Some(hit) = state.semantic_cache.lookup(&rl_key, &prompt_text, &request.model).await {
             info!(
                 request_id = %request_id,
@@ -576,7 +625,7 @@ async fn handle_non_streaming(
             // vs. the same GPT-4o baseline used on the normal path, since
             // no provider was actually billed.
             let cache_hit_latency_ms = start.elapsed().as_millis() as u64;
-            let input_tokens = tokens::count_request_tokens(&request.messages, &request.model)
+            let input_tokens = tokens::count_completion_request_tokens(&request)
                 .unwrap_or(0);
             let output_tokens = cached_response
                 .choices
@@ -629,7 +678,7 @@ async fn handle_non_streaming(
         }
     }
 
-    let input_tokens = tokens::count_request_tokens(&request.messages, &request.model)
+    let input_tokens = tokens::count_completion_request_tokens(&request)
         .map_err(|e| {
             error!("Token counting failed: {}", e);
             ApiError::InternalError(format!("Token counting failed: {}", e))
@@ -698,7 +747,7 @@ async fn handle_non_streaming(
     let input_tokens = match sc_messages {
         Some(messages) => {
             request.messages = messages;
-            sc_report.compressed_tokens
+            tokens::count_completion_request_tokens(&request).unwrap_or(input_tokens)
         }
         None => input_tokens,
     };
@@ -726,6 +775,11 @@ async fn handle_non_streaming(
             state.spend_guard.release(&rl_key, estimated_cost.total_cost_cents);
             e
         })?;
+
+    if let Err(e) = validate_tool_wire(&request, byok.provider_to_call) {
+        state.spend_guard.release(&rl_key, estimated_cost.total_cost_cents);
+        return Err(e);
+    }
 
     if byok.used_openrouter_fallback {
         info!(
@@ -783,7 +837,10 @@ async fn handle_non_streaming(
     let latency_ms = connector_result.latency_ms;
     let output_tokens = connector_result.output_tokens;
 
-    if !prompt_text.is_empty() {
+    if cacheable_chat_request(&request)
+        && response.choices.iter().all(|choice| choice.message.tool_calls.is_none())
+        && !prompt_text.is_empty()
+    {
         if let Ok(response_json) = serde_json::to_string(&response) {
             // FIX (#9): key the cache by the ORIGINAL requested model
             // string, not the provider's echoed response.model. This is
@@ -1046,7 +1103,7 @@ fn maybe_fire_shadow_request(
         // outgoing shadow_request (same messages as the primary call, since
         // shadow mode sends an identical prompt), then price it with the
         // shadow model's own rates. No char-count guessing.
-        let shadow_input_tokens = tokens::count_request_tokens(&shadow_request.messages, &shadow_request.model)
+        let shadow_input_tokens = tokens::count_completion_request_tokens(&shadow_request)
             .unwrap_or(0);
         let shadow_estimated_output = tokens::estimate_output_tokens(shadow_request.max_tokens, &shadow_request.model);
         // get_pricing_for: the shadow call is fully billed and reserved
@@ -1472,4 +1529,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     axum::serve(listener, app).await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod request_safety_tests {
+    use super::*;
+
+    fn request(messages: serde_json::Value) -> ChatCompletionRequest {
+        serde_json::from_value(json!({ "model": "gpt-6-sol", "messages": messages })).unwrap()
+    }
+
+    #[test]
+    fn cache_requires_one_plain_user_turn() {
+        let one = request(json!([{ "role": "user", "content": "Hello" }]));
+        assert!(cacheable_chat_request(&one));
+
+        let history = request(json!([
+            { "role": "system", "content": "Always speak French" },
+            { "role": "user", "content": "Hello" }
+        ]));
+        assert!(!cacheable_chat_request(&history));
+
+        let tool_turn = request(json!([
+            { "role": "assistant", "content": null, "tool_calls": [{"id":"call_1","type":"function","function":{"name":"book","arguments":"{}"}}] },
+            { "role": "tool", "tool_call_id": "call_1", "content": "done" },
+            { "role": "user", "content": "Thanks" }
+        ]));
+        assert!(!cacheable_chat_request(&tool_turn));
+
+        let mut with_tools = one.clone();
+        with_tools.tools = Some(vec![json!({"type":"function","function":{"name":"book"}})]);
+        assert!(!cacheable_chat_request(&with_tools));
+        let mut sampled = one;
+        sampled.temperature = Some(0.5);
+        assert!(!cacheable_chat_request(&sampled));
+    }
 }

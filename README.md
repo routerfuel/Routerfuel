@@ -13,10 +13,12 @@ RouterFuel never holds a billable key of its own. Every request is billed to *yo
 - **Azure OpenAI** — bring your own Azure OpenAI deployment; supply an endpoint + API key (or managed identity) via the `X-Azure-OpenAI-Connection` header. Models are fetched dynamically from your Azure Foundry deployments list at startup
 - **AWS Bedrock** — bring your own AWS Bedrock access; supply region + IAM credentials via the `X-Bedrock-Connection` header. Available foundation models are fetched dynamically from the Bedrock `ListFoundationModels` API at startup
 - **Vision support** — send images (URL or base64) to any vision-capable model in the registry
-- **Semantic caching** — a local ONNX embedding model (no external API cost) matches semantically similar prompts and serves cached responses instead of re-calling a provider. Cached entries are scoped per client — two different clients sending the same prompt never share a cache entry
+- **Semantic caching** — a local ONNX embedding model (no external API cost) matches semantically similar prompts and serves cached responses instead of re-calling a provider. Cache entries are scoped per client and currently apply only to single plain-text user turns with default generation parameters; conversation histories and tool requests bypass the cache.
+- **OpenAI-format tool turns** — function definitions, tool choices, assistant tool calls, and tool results pass through the OpenAI-compatible connectors. Anthropic's native `/v1/messages` endpoint preserves its own tool format; OpenAI-format tool calls to the Anthropic, Gemini, Vertex, or Bedrock chat connectors are rejected until translation is implemented.
 - **Cost tracking & audit trail** — every request is logged with token counts, cost, latency, and savings vs. a GPT-4o baseline
 - **Circuit breaker** — automatically stops sending traffic to a provider that's returning errors, and probes it back into rotation once it recovers
-- **Rate limiting & tiers** — per-client rate limits (free / pro / enterprise), configurable via env var or a Postgres table; tier changes take effect on the **next server restart** (tiers are loaded once at startup, not watched live)
+- **Rate limiting & tiers** — per-key rate limits (free / pro / enterprise), configurable via env var or the `client_tiers` Postgres table; database changes are reloaded on a timer (default 30 seconds)
+- **Stable organization identity** — a database-provisioned `organization_id` can group multiple client keys so request logs stay associated with one tenant across key rotation; existing and env-only keys retain their individual key hash as the default identity
 - **Concurrency limiting** — bounds in-flight provider calls so a traffic spike doesn't get you rate-limited or IP-blocked upstream
 - **Guardrails** — LoopGuard flags a client stuck retrying the same prompt; SpendGuard hard-caps per-client spend in a rolling window
 - **Shadow-mode A/B testing** — fire a second, comparison-only call at a different model alongside the real one, without affecting what the client receives. **Enabled by default** — any client can trigger it by sending `shadow_model` on a request, and it bills a second real call to their BYOK key
@@ -70,13 +72,19 @@ cargo build --release
 
 **2. Set up the database**
 
-Create a Postgres database with the `vector` extension available, then run the migrations in `migrations/` in order (001 through 007). If you're using `sqlx-cli`:
+Create a Postgres database with the `vector` extension available, then run all SQL migrations in `migrations/` in numeric order (currently 001 through 012). If you're using `sqlx-cli`:
 
 ```
 sqlx migrate run
 ```
 
 Migrations run automatically on startup too, via `sqlx::migrate!` in `main.rs`.
+
+### Organization and client keys
+
+`client_tiers.client_id` is the SHA-256 hash of one RouterFuel API key. `client_tiers.organization_id` is the stable tenant identifier: provision additional or rotated keys with the same organization ID. For example, insert a second row with a different `client_id` but the existing `organization_id`, then revoke the old row with `active = FALSE`. The `client_name` and `notes` fields are not authorization identities.
+
+Migration 011 backfills existing keys with their own hash as the organization ID. A new row that omits `organization_id` also defaults to its key hash. Env-only keys use their hash as their identity. Migration 012 snapshots the organization ID in `request_logs` at insertion; regrouping a key later does not silently rewrite historical logs. Rate limits and spend guards remain keyed by the individual client key hash, not the organization ID. Organization-scoped MCP permissions and conversation analytics are not implemented yet.
 
 **3. Set environment variables**
 
@@ -171,7 +179,7 @@ src/
   bedrock_catalog.rs        — pulls AWS Bedrock's foundation model list into the registry
 static/
   dashboard.html            — self-contained admin dashboard UI, served at /admin/dashboard
-migrations/                — Postgres schema, run in numeric order (001–007)
+migrations/                — Postgres schema, run in numeric order (001–012)
 scripts/
   generate-key.sh           — generates a client API key + its SHA-256 hash
 Dockerfile                  — multi-stage build (see Quickstart above)

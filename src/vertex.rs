@@ -290,6 +290,11 @@ impl Connector for VertexConnector {
         req: &ChatCompletionRequest,
         raw: &str,
     ) -> Result<ConnectorResult, ConnectorError> {
+        if crate::connectors::has_tool_payload(req) {
+            return Err(ConnectorError::BadResponse(
+                "OpenAI-format tools are not yet supported on the Vertex connector".into(),
+            ));
+        }
         let started = Instant::now();
         if self.circuit_breaker.is_open(Provider::VertexAI) {
             return Err(ConnectorError::CircuitOpen);
@@ -354,6 +359,9 @@ impl Connector for VertexConnector {
                     message: ChatMessage {
                         role: "assistant".into(),
                         content: crate::vision::MessageContent::Text(content),
+                        tool_calls: None,
+                        tool_call_id: None,
+                        name: None,
                     },
                     finish_reason: finish,
                 }],

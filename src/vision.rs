@@ -27,12 +27,14 @@ pub struct MultimodalMessage {
 pub enum MessageContent {
     Text(String),
     Parts(Vec<ContentPart>),
+    Null,
 }
 
 impl MessageContent {
     pub fn as_text(&self) -> String {
         match self {
             MessageContent::Text(s) => s.clone(),
+            MessageContent::Null => String::new(),
             MessageContent::Parts(parts) => parts
                 .iter()
                 .filter_map(|p| match &p.kind {
@@ -47,6 +49,7 @@ impl MessageContent {
     pub fn has_image(&self) -> bool {
         match self {
             MessageContent::Text(_) => false,
+            MessageContent::Null => false,
             MessageContent::Parts(parts) => parts.iter().any(|p| !matches!(p.kind, PartKind::Text { .. })),
         }
     }
@@ -93,6 +96,7 @@ pub struct ImageBase64 {
 
 pub fn to_anthropic_content(msg: &MultimodalMessage) -> serde_json::Value {
     match &msg.content {
+        MessageContent::Null => serde_json::json!({ "role": msg.role, "content": null }),
         MessageContent::Text(t) => serde_json::json!({
             "role": msg.role,
             "content": t
@@ -131,6 +135,7 @@ pub fn to_gemini_content(msg: &MultimodalMessage) -> serde_json::Value {
     let role = if msg.role == "assistant" { "model" } else { "user" };
 
     match &msg.content {
+        MessageContent::Null => serde_json::json!({ "role": role, "parts": [] }),
         MessageContent::Text(t) => serde_json::json!({
             "role": role,
             "parts": [{ "text": t }]
@@ -161,6 +166,7 @@ pub fn to_gemini_content(msg: &MultimodalMessage) -> serde_json::Value {
 
 pub fn to_openai_compatible_content(msg: &MultimodalMessage) -> serde_json::Value {
     match &msg.content {
+        MessageContent::Null => serde_json::json!({ "role": msg.role, "content": null }),
         MessageContent::Text(t) => serde_json::json!({
             "role": msg.role,
             "content": t

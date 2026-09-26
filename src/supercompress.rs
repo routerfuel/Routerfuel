@@ -216,6 +216,11 @@ pub fn compress(
     if mode == ServerMode::Off || !opts.enabled {
         return (None, report);
     }
+    // Tool arguments and tool results may be executable or signed payloads.
+    // Even whitespace edits can change their meaning, so leave agent turns intact.
+    if messages.iter().any(|m| m.role == "tool" || m.tool_calls.is_some() || m.tool_call_id.is_some()) {
+        return (None, report);
+    }
 
     let mut working = messages.to_vec();
 
@@ -227,6 +232,7 @@ pub fn compress(
             let (original_len, normalized) = match &m.content {
                 MessageContent::Text(s) => (s.len(), normalize_whitespace(s)),
                 MessageContent::Parts(_) => continue,
+                MessageContent::Null => continue,
             };
             if normalized.len() < original_len {
                 report.whitespace_chars_removed += original_len - normalized.len();
@@ -405,6 +411,9 @@ mod tests {
         ChatMessage {
             role: role.to_string(),
             content: MessageContent::Text(text.to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
         }
     }
 
@@ -423,6 +432,9 @@ mod tests {
                     },
                 },
             ]),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
         }
     }
 
