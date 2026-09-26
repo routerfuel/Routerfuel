@@ -363,6 +363,124 @@ struct AnthropicReq {
     /// with role "system".
     #[serde(skip_serializing_if = "Option::is_none")]
     system: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<serde_json::Value>,
+}
+
+fn anthropic_tool_request(req: &ChatCompletionRequest) -> Result<AnthropicReq, ConnectorError> {
+    use serde_json::{json, Value};
+    let bad = |message: &str| ConnectorError::BadResponse(message.to_string());
+    let mut tools = Vec::new();
+    for tool in req.tools.as_deref().unwrap_or(&[]) {
+        if tool.get("strict") == Some(&Value::Bool(true)) {
+            return Err(bad("Strict-mode tool schemas aren't supported through the Anthropic connector yet"));
+        }
+        if tool.get("type").and_then(Value::as_str) != Some("function") {
+            return Err(bad("Anthropic connector supports only function tools"));
+        }
+        let function = tool.get("function").ok_or_else(|| bad("Function tool is missing function"))?;
+        if function.get("strict") == Some(&Value::Bool(true)) {
+            return Err(bad("Strict-mode tool schemas aren't supported through the Anthropic connector yet"));
+        }
+        if function.get("strict").is_some() && function.get("strict") != Some(&Value::Bool(false)) {
+            return Err(bad("Function strict must be a boolean"));
+        }
+        let name = function.get("name").and_then(Value::as_str).filter(|s| !s.is_empty())
+            .ok_or_else(|| bad("Function tool is missing a name"))?;
+        let schema = function.get("parameters").cloned()
+            .ok_or_else(|| bad("Function tool is missing parameters; an input schema is required"))?;
+        if !schema.is_object() {
+            return Err(bad("Function parameters must be a JSON object"));
+        }
+        let mut mapped = json!({"name":name,"input_schema":schema});
+        if let Some(description) = function.get("description") {
+            if !description.is_string() { return Err(bad("Function description must be a string")); }
+            mapped["description"] = description.clone();
+        }
+        tools.push(mapped);
+    }
+
+    let mut choice = match req.tool_choice.as_ref() {
+        None => None,
+        Some(Value::String(s)) if s == "auto" => Some(json!({"type":"auto"})),
+        Some(Value::String(s)) if s == "required" => Some(json!({"type":"any"})),
+        Some(Value::String(s)) if s == "none" => {
+            tools.clear();
+            None
+        }
+        Some(value) if value.get("type").and_then(Value::as_str) == Some("function") => {
+            let name = value.pointer("/function/name").and_then(Value::as_str)
+                .ok_or_else(|| bad("Named tool choice is missing function.name"))?;
+            if !tools.iter().any(|t| t["name"] == name) {
+                return Err(bad("Named tool choice is not in the tools list"));
+            }
+            Some(json!({"type":"tool","name":name}))
+        }
+        _ => return Err(bad("Unsupported tool_choice for Anthropic connector")),
+    };
+    if choice.is_some() && tools.is_empty() {
+        return Err(bad("tool_choice requires at least one function tool"));
+    }
+    if let Some(parallel) = req.parallel_tool_calls {
+        if tools.is_empty() { return Err(bad("parallel_tool_calls requires function tools")); }
+        if !parallel {
+            let selected = choice.get_or_insert_with(|| json!({"type":"auto"}));
+            selected["disable_parallel_tool_use"] = json!(true);
+        }
+    }
+
+    let mut messages = Vec::new();
+    let mut system_text = String::new();
+    for message in &req.messages {
+        if message.name.is_some() { return Err(bad("Named messages are not supported by the Anthropic connector")); }
+        if message.role == "system" {
+            if !system_text.is_empty() { system_text.push(' '); }
+            system_text.push_str(&message.content.as_text());
+            continue;
+        }
+        if message.role == "tool" {
+            let id = message.tool_call_id.as_deref().filter(|s| !s.is_empty())
+                .ok_or_else(|| bad("Tool result is missing tool_call_id"))?;
+            if !matches!(message.content, crate::vision::MessageContent::Text(_)) {
+                return Err(bad("Anthropic tool results currently require text content"));
+            }
+            messages.push(json!({"role":"user","content":[{"type":"tool_result","tool_use_id":id,"content":message.content.as_text()}]}));
+            continue;
+        }
+        if message.tool_call_id.is_some() { return Err(bad("tool_call_id is only valid on tool messages")); }
+        let mm = crate::vision::MultimodalMessage { role: message.role.clone(), content: message.content.clone() };
+        let mut converted = crate::vision::to_anthropic_content(&mm);
+        if let Some(calls) = &message.tool_calls {
+            if message.role != "assistant" { return Err(bad("tool_calls are only valid on assistant messages")); }
+            let mut blocks = match converted.get("content") {
+                Some(Value::String(text)) if !text.is_empty() => vec![json!({"type":"text","text":text})],
+                Some(Value::Null) => Vec::new(),
+                _ => return Err(bad("Assistant tool calls currently require text or null content")),
+            };
+            for call in calls {
+                let id = call.get("id").and_then(Value::as_str).ok_or_else(|| bad("Tool call is missing id"))?;
+                if call.get("type").and_then(Value::as_str) != Some("function") { return Err(bad("Only function tool calls are supported")); }
+                let name = call.pointer("/function/name").and_then(Value::as_str).ok_or_else(|| bad("Tool call is missing function.name"))?;
+                let args = call.pointer("/function/arguments").and_then(Value::as_str).ok_or_else(|| bad("Tool call arguments must be a JSON string"))?;
+                let input: Value = serde_json::from_str(args).map_err(|_| bad("Tool call arguments must contain valid JSON"))?;
+                if !input.is_object() { return Err(bad("Anthropic tool input must be a JSON object")); }
+                blocks.push(json!({"type":"tool_use","id":id,"name":name,"input":input}));
+            }
+            converted["content"] = json!(blocks);
+        }
+        messages.push(converted);
+    }
+    Ok(AnthropicReq {
+        model: req.model.clone(), messages, max_tokens: req.max_tokens.unwrap_or(1024),
+        temperature: req.temperature, system: (!system_text.is_empty()).then_some(system_text),
+        tools: (!tools.is_empty()).then_some(tools), tool_choice: choice,
+    })
+}
+
+pub(crate) fn validate_anthropic_tool_request(req: &ChatCompletionRequest) -> Result<(), String> {
+    anthropic_tool_request(req).map(|_| ()).map_err(|error| error.to_string())
 }
 
 pub fn build_anthropic_messages(messages: &[ChatMessage]) -> (Vec<serde_json::Value>, Option<String>) {
@@ -399,6 +517,9 @@ struct AnthropicBlock {
     #[serde(rename = "type")]
     kind: String,
     text: Option<String>,
+    id: Option<String>,
+    name: Option<String>,
+    input: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -407,14 +528,54 @@ struct AnthropicUsage {
     output_tokens: u32,
 }
 
+fn map_anthropic_response(ar: AnthropicResp) -> Result<ChatCompletionResponse, ConnectorError> {
+    let mut text_blocks = Vec::new();
+    let mut tool_calls = Vec::new();
+    for block in &ar.content {
+        match block.kind.as_str() {
+            "text" => text_blocks.push(block.text.as_deref().ok_or_else(|| ConnectorError::BadResponse("Anthropic text block missing text".into()))?),
+            "tool_use" => {
+                let id = block.id.as_deref().ok_or_else(|| ConnectorError::BadResponse("Anthropic tool_use missing id".into()))?;
+                let name = block.name.as_deref().ok_or_else(|| ConnectorError::BadResponse("Anthropic tool_use missing name".into()))?;
+                let input = block.input.as_ref().filter(|v| v.is_object()).ok_or_else(|| ConnectorError::BadResponse("Anthropic tool_use input must be an object".into()))?;
+                tool_calls.push(serde_json::json!({"id":id,"type":"function","function":{"name":name,"arguments":input.to_string()}}));
+            }
+            other => return Err(ConnectorError::BadResponse(format!("Unsupported Anthropic content block: {other}"))),
+        }
+    }
+    let finish_reason = match ar.stop_reason.as_str() {
+        "tool_use" if !tool_calls.is_empty() => "tool_calls",
+        "end_turn" | "stop_sequence" if tool_calls.is_empty() => "stop",
+        "max_tokens" if tool_calls.is_empty() => "length",
+        other => return Err(ConnectorError::BadResponse(format!("Anthropic stop reason and tool blocks disagree: {other}"))),
+    };
+    let content = if text_blocks.is_empty() && !tool_calls.is_empty() {
+        crate::vision::MessageContent::Null
+    } else {
+        crate::vision::MessageContent::Text(text_blocks.join(""))
+    };
+    Ok(ChatCompletionResponse {
+        id: ar.id, object: "chat.completion".into(), created: unix_now(), model: ar.model,
+        choices: vec![Choice {
+            index: 0,
+            message: ChatMessage { role: "assistant".into(), content,
+                tool_calls: (!tool_calls.is_empty()).then_some(tool_calls), tool_call_id: None, name: None },
+            finish_reason: finish_reason.into(),
+        }],
+        usage: Usage { prompt_tokens: ar.usage.input_tokens, completion_tokens: ar.usage.output_tokens,
+            total_tokens: ar.usage.input_tokens + ar.usage.output_tokens },
+    })
+}
+
 pub struct AnthropicConnector {
     client: reqwest::Client,
     circuit_breaker: Arc<CircuitBreaker>,
+    url: String,
 }
 
 impl AnthropicConnector {
     pub fn new(circuit_breaker: Arc<CircuitBreaker>) -> Self {
-        Self { client: build_client(), circuit_breaker }
+        Self { client: build_client(), circuit_breaker, url: ANTHROPIC_URL.into() }
     }
 }
 
@@ -426,29 +587,17 @@ impl Connector for AnthropicConnector {
         req: &ChatCompletionRequest,
         client_api_key: &str,
     ) -> Result<ConnectorResult, ConnectorError> {
-        if has_tool_payload(req) {
-            return Err(ConnectorError::BadResponse(
-                "OpenAI-format tools are not yet supported on the Anthropic connector; use /v1/messages".into(),
-            ));
-        }
         let start = Instant::now();
 
         if self.circuit_breaker.is_open(Provider::Anthropic) {
             return Err(ConnectorError::CircuitOpen);
         }
 
-        let (messages, system) = build_anthropic_messages(&req.messages);
-        let body = AnthropicReq {
-            model: req.model.clone(),
-            messages,
-            max_tokens: req.max_tokens.unwrap_or(1024),
-            temperature: req.temperature,
-            system,
-        };
+        let body = anthropic_tool_request(req)?;
 
         let http_resp = self
             .client
-            .post(ANTHROPIC_URL)
+            .post(&self.url)
             .header("x-api-key", client_api_key)
             .header("anthropic-version", ANTHROPIC_VER)
             .header("content-type", "application/json")
@@ -482,41 +631,13 @@ impl Connector for AnthropicConnector {
                 let ar: AnthropicResp = serde_json::from_str(&text).map_err(|e| {
                     ConnectorError::BadResponse(format!("Provider returned unexpected response format: {e}"))
                 })?;
-                let content = ar
-                    .content
-                    .iter()
-                    .find(|b| b.kind == "text")
-                    .and_then(|b| b.text.as_deref())
-                    .unwrap_or("")
-                    .to_owned();
-
-                let response = ChatCompletionResponse {
-                    id: ar.id,
-                    object: "chat.completion".into(),
-                    created: unix_now(),
-                    model: ar.model.clone(),
-                    choices: vec![Choice {
-                        index: 0,
-                        message: ChatMessage {
-                            role: "assistant".into(),
-                            content: crate::vision::MessageContent::Text(content),
-                            tool_calls: None,
-                            tool_call_id: None,
-                            name: None,
-                        },
-                        finish_reason: ar.stop_reason,
-                    }],
-                    usage: Usage {
-                        prompt_tokens: ar.usage.input_tokens,
-                        completion_tokens: ar.usage.output_tokens,
-                        total_tokens: ar.usage.input_tokens + ar.usage.output_tokens,
-                    },
-                };
+                let model_id = ar.model.clone();
+                let response = map_anthropic_response(ar)?;
 
                 self.circuit_breaker.record_success(Provider::Anthropic);
                 Ok(ConnectorResult {
                     provider: Provider::Anthropic,
-                    model_id: ar.model,
+                    model_id,
                     input_tokens: response.usage.prompt_tokens,
                     output_tokens: response.usage.completion_tokens,
                     latency_ms: start.elapsed().as_millis() as u64,
@@ -1290,6 +1411,87 @@ mod tests {
             shadow_model: None,
             supercompress: None,
         }
+    }
+
+    fn anthro_req() -> ChatCompletionRequest {
+        let mut request = req("claude-sonnet-4-5");
+        request.tools = Some(vec![serde_json::json!({
+            "type":"function", "function":{"name":"book","description":"Book a slot",
+                "parameters":{"type":"object","properties":{"slot":{"type":"string"}}}}
+        })]);
+        request.tool_choice = Some(serde_json::json!("auto"));
+        request
+    }
+
+    #[test]
+    fn anthro_rejects_strict_tool_schema_without_dropping_it() {
+        let mut request = anthro_req();
+        request.tools.as_mut().unwrap()[0]["function"]["strict"] = serde_json::json!(true);
+        let error = validate_anthropic_tool_request(&request).unwrap_err();
+        assert!(error.contains("Strict-mode tool schemas aren't supported"));
+    }
+
+    #[test]
+    fn anthro_maps_choice_parallel_and_rejects_unmappable_inputs() {
+        let mut request = anthro_req();
+        request.parallel_tool_calls = Some(false);
+        request.tool_choice = Some(serde_json::json!("required"));
+        let body = serde_json::to_value(anthropic_tool_request(&request).unwrap()).unwrap();
+        assert_eq!(body["tool_choice"], serde_json::json!({"type":"any","disable_parallel_tool_use":true}));
+        request.tool_choice = Some(serde_json::json!({"type":"function","function":{"name":"book"}}));
+        let body = serde_json::to_value(anthropic_tool_request(&request).unwrap()).unwrap();
+        assert_eq!(body["tool_choice"]["name"], "book");
+        request.messages.push(serde_json::from_value(serde_json::json!({
+            "role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function",
+                "function":{"name":"book","arguments":"not JSON"}}]
+        })).unwrap());
+        assert!(validate_anthropic_tool_request(&request).unwrap_err().contains("valid JSON"));
+    }
+
+    #[tokio::test]
+    async fn anthro_tool_call_and_result_complete_over_mock_http() {
+        use axum::{routing::post, Json, Router};
+        use parking_lot::Mutex;
+        let seen = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let capture = Arc::clone(&seen);
+        let app = Router::new().route("/v1/messages", post(move |Json(body): Json<serde_json::Value>| {
+            let capture = Arc::clone(&capture);
+            async move {
+                let is_result = body["messages"].as_array().unwrap().len() > 1;
+                capture.lock().push(body);
+                if is_result {
+                    Json(serde_json::json!({"id":"msg_2","model":"claude-sonnet-4-5",
+                        "content":[{"type":"text","text":"Booked."}],"stop_reason":"end_turn",
+                        "usage":{"input_tokens":30,"output_tokens":6}}))
+                } else {
+                    Json(serde_json::json!({"id":"msg_1","model":"claude-sonnet-4-5",
+                        "content":[{"type":"text","text":"Checking."},
+                            {"type":"tool_use","id":"call_1","name":"book","input":{"slot":"noon"}}],
+                        "stop_reason":"tool_use","usage":{"input_tokens":20,"output_tokens":9}}))
+                }
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let mut connector = AnthropicConnector::new(Arc::new(CircuitBreaker::new()));
+        connector.url = format!("http://{address}/v1/messages");
+
+        let mut request = anthro_req();
+        let first = connector.complete(&request, "local-test-key").await.unwrap();
+        assert_eq!(first.response.choices[0].finish_reason, "tool_calls");
+        let call = first.response.choices[0].message.tool_calls.as_ref().unwrap()[0].clone();
+        assert_eq!(call["function"]["arguments"], "{\"slot\":\"noon\"}");
+        request.messages.push(first.response.choices[0].message.clone());
+        request.messages.push(serde_json::from_value(serde_json::json!({
+            "role":"tool","tool_call_id":"call_1","content":"confirmed"
+        })).unwrap());
+        let second = connector.complete(&request, "local-test-key").await.unwrap();
+        assert_eq!(second.response.choices[0].message.content.as_text(), "Booked.");
+        let captures = seen.lock();
+        assert_eq!(captures[0]["tools"][0]["name"], "book");
+        assert_eq!(captures[1]["messages"][1]["content"][1]["type"], "tool_use");
+        assert_eq!(captures[1]["messages"][2]["content"][0]["tool_use_id"], "call_1");
     }
 
     #[test]

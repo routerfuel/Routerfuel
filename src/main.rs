@@ -279,8 +279,14 @@ fn cacheable_chat_request(request: &ChatCompletionRequest) -> bool {
 }
 
 fn validate_tool_wire(request: &ChatCompletionRequest, provider: Provider) -> Result<(), ApiError> {
+    if connectors::has_tool_payload(request) && provider == Provider::Anthropic {
+        if request.stream.unwrap_or(false) {
+            return Err(ApiError::BadRequest("Streaming OpenAI-format tool calls are not supported by the Anthropic connector yet".into()));
+        }
+        connectors::validate_anthropic_tool_request(request).map_err(ApiError::BadRequest)?;
+    }
     if connectors::has_tool_payload(request)
-        && matches!(provider, Provider::Anthropic | Provider::Gemini | Provider::VertexAI | Provider::Bedrock)
+        && matches!(provider, Provider::Gemini | Provider::VertexAI | Provider::Bedrock)
     {
         return Err(ApiError::BadRequest(format!(
             "OpenAI-format tool calls are not supported by the {provider} connector. Use an OpenAI-compatible provider or Anthropic's native /v1/messages endpoint."
@@ -465,7 +471,8 @@ fn resolve_model(
             Provider::Qwen, Provider::Moonshot, Provider::Zhipu, Provider::Groq,
             Provider::AzureOpenAI,
         ];
-        let allowed: HashSet<_> = tool_wire_providers.into_iter().collect();
+        let mut allowed: HashSet<_> = tool_wire_providers.into_iter().collect();
+        if !request.stream.unwrap_or(false) { allowed.insert(Provider::Anthropic); }
         match &mut reachable {
             Some(providers) => providers.retain(|provider| allowed.contains(provider)),
             None => reachable = Some(allowed),
@@ -1563,5 +1570,19 @@ mod request_safety_tests {
         let mut sampled = one;
         sampled.temperature = Some(0.5);
         assert!(!cacheable_chat_request(&sampled));
+    }
+
+    #[test]
+    fn anthropic_tool_wire_is_non_streaming_only() {
+        let mut request = request(json!([{ "role": "user", "content": "Book noon" }]));
+        request.tools = Some(vec![json!({"type":"function","function":{
+            "name":"book","parameters":{"type":"object","properties":{}}
+        }})]);
+        assert!(validate_tool_wire(&request, Provider::Anthropic).is_ok());
+        request.stream = Some(true);
+        assert!(matches!(validate_tool_wire(&request, Provider::Anthropic), Err(ApiError::BadRequest(_))));
+        request.stream = None;
+        request.tools.as_mut().unwrap()[0]["function"]["strict"] = json!(true);
+        assert!(matches!(validate_tool_wire(&request, Provider::Anthropic), Err(ApiError::BadRequest(_))));
     }
 }
