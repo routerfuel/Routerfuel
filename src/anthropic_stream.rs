@@ -2,7 +2,7 @@
 //! This module never logs provider event bodies or tool arguments.
 
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 const MAX_PENDING_FRAME: usize = 1024 * 1024;
 
@@ -68,6 +68,7 @@ pub(crate) struct Translator {
     model: String,
     created: i64,
     tools: HashMap<usize, ToolState>,
+    thinking_blocks: HashSet<usize>,
     next_tool_index: usize,
     stop_reason: Option<String>,
     pub(crate) input_tokens: u32,
@@ -142,6 +143,13 @@ impl Translator {
                         ));
                     }
                     "text" => {}
+                    "thinking" => {
+                        if self.tools.contains_key(&block_index)
+                            || !self.thinking_blocks.insert(block_index)
+                        {
+                            return Err("Duplicate Anthropic thinking block index".into());
+                        }
+                    }
                     _ => return Err("Unsupported Anthropic streaming content block".into()),
                 }
             }
@@ -175,12 +183,24 @@ impl Translator {
                             Value::Null,
                         ));
                     }
+                    "thinking_delta" | "signature_delta"
+                        if self.thinking_blocks.contains(&block_index) =>
+                    {
+                        // Internal thinking and its signature have no OpenAI
+                        // tool-call equivalent and must not leak to clients.
+                    }
                     _ => return Err("Unsupported Anthropic streaming delta".into()),
                 }
             }
             "content_block_stop" => {
                 self.require_started()?;
                 let block_index = required_index(&event)?;
+                if self.thinking_blocks.remove(&block_index) {
+                    return Ok(Translated {
+                        chunks,
+                        done: false,
+                    });
+                }
                 let mut empty_arguments_index = None;
                 if let Some(tool) = self.tools.get_mut(&block_index) {
                     if tool.ended {
@@ -296,6 +316,58 @@ mod tests {
             json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":7}}),
             json!({"type":"message_stop"}),
         ]
+    }
+
+    #[test]
+    fn live_sonnet_5_weather_shape_skips_thinking_before_tool_use() {
+        // Captured from a real claude-sonnet-5 stream with get_weather on 2026-09-26.
+        // IDs and the opaque thinking signature are redacted; event types,
+        // indexes, caller, and partial_json boundaries match the capture.
+        let captured = vec![
+            json!({"type":"message_start","message":{"model":"claude-sonnet-5","id":"msg_redacted","type":"message","role":"assistant","content":[],"stop_reason":null,"usage":{"input_tokens":452,"output_tokens":8}}}),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}),
+            json!({"type":"ping"}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":""}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"redacted"}}),
+            json!({"type":"content_block_stop","index":0}),
+            json!({"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_redacted","name":"get_weather","input":{},"caller":{"type":"direct"}}}),
+            json!({"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":""}}),
+            json!({"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"city\""}}),
+            json!({"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":": \"Duba"}}),
+            json!({"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"i\"}"}}),
+            json!({"type":"content_block_stop","index":1}),
+            json!({"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"input_tokens":452,"output_tokens":79,"output_tokens_details":{"thinking_tokens":26}}}),
+            json!({"type":"message_stop"}),
+        ];
+        let mut framer = SseFramer::default();
+        let mut translator = Translator::default();
+        let mut chunks = Vec::new();
+        let mut done = false;
+        for frame in framer.push(wire(&captured).as_bytes()).unwrap() {
+            let result = translator.translate(&frame).unwrap();
+            chunks.extend(result.chunks);
+            done = result.done;
+        }
+        assert!(done);
+        assert_eq!(
+            chunks[1]["choices"][0]["delta"]["tool_calls"][0]["index"],
+            0
+        );
+        assert_eq!(
+            chunks[1]["choices"][0]["delta"]["tool_calls"][0]["function"]["name"],
+            "get_weather"
+        );
+        let args = chunks
+            .iter()
+            .filter_map(|chunk| {
+                chunk["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"].as_str()
+            })
+            .collect::<String>();
+        assert_eq!(args, "{\"city\": \"Dubai\"}");
+        assert_eq!(
+            chunks.last().unwrap()["choices"][0]["finish_reason"],
+            "tool_calls"
+        );
     }
 
     #[test]
