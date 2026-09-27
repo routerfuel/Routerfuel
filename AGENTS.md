@@ -4,13 +4,15 @@ RouterFuel is a self-hosted, BYOK Rust gateway (Axum, sqlx/Postgres, pgvector). 
 
 ## Shipped on `feat/voice-agent-foundation`
 
-- Tool calls are supported through OpenAI-compatible connectors and the Anthropic connector on `/v1/chat/completions`, including Anthropic streaming SSE translation. Native Anthropic `/v1/messages` supports its own format. Gemini and Vertex ordinary function tools are translated only on the non-streaming OpenAI-shaped path; streaming, strict mode, and repeated same-name calls in one turn remain rejected. Bedrock translation is not implemented. Do not claim Gemini or Vertex has had a paid live-provider verification.
+- Tool calls are supported through OpenAI-compatible connectors and the Anthropic connector on `/v1/chat/completions`, including Anthropic streaming SSE translation. Native Anthropic `/v1/messages` supports its own format. Gemini and Vertex ordinary function tools are translated only on the non-streaming OpenAI-shaped path; streaming, strict mode, and repeated same-name calls in one turn remain rejected. Vertex tool-call translation is tested with mocks only, not a real Vertex request. Bedrock translation is not implemented. Do not claim Gemini or Vertex has had a paid live-provider verification.
 - Semantic cache eligibility is limited to a safe single plain-text user turn with default settings; tool, conversation, shadow, and compression traffic bypass it. Tool-compatible routing is filtered accordingly.
 - Migrations 011 and 012 add `client_tiers.organization_id` and snapshot it into `request_logs`. A stable organization may own multiple API-key hashes. Existing and env-only keys default to their own hash. `client_id` remains the individual key hash for auth, revocation, rate limiting, and current spend guards. Do not use `client_name`, `notes`, or a caller-supplied header as an authorization identity.
 
 ## Not shipped
 
 Voice transports, speech/transcription, MCP server registry and permissions, conversation/outcome ledger, deployment-pool failover, and outcome-based optimization remain roadmap work. Do not describe them as available APIs. See `docs/voice-agent-build-plan.md` for design invariants and release gates, not feature claims.
+
+Follow-up: live-verify Vertex tool calls with a real project, region, enabled Vertex AI API, and authorized service-account credentials before calling the integration provider-verified.
 
 ## Verification and delivery
 
