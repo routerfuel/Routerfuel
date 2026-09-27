@@ -708,7 +708,7 @@ struct GeminiUsageMetadata {
 }
 
 #[derive(Debug, Deserialize)]
-struct GeminiResp {
+pub(crate) struct GeminiResp {
     candidates: Vec<GeminiCandidate>,
     #[serde(rename = "usageMetadata")]
     usage_metadata: Option<GeminiUsageMetadata>,
@@ -752,10 +752,10 @@ pub fn to_gemini_body(req: &ChatCompletionRequest) -> serde_json::Value {
     body
 }
 
-fn gemini_tool_body(req: &ChatCompletionRequest) -> Result<serde_json::Value, ConnectorError> {
+pub(crate) fn google_tool_body(req: &ChatCompletionRequest, provider: &str) -> Result<serde_json::Value, ConnectorError> {
     use serde_json::{json, Value};
     use std::collections::{HashMap, HashSet};
-    let bad = |message: &str| ConnectorError::BadResponse(message.to_string());
+    let bad = |message: &str| ConnectorError::BadResponse(message.replace("Gemini", provider));
     if req.parallel_tool_calls == Some(false) {
         return Err(bad("parallel_tool_calls: false is not supported by the Gemini connector"));
     }
@@ -856,13 +856,13 @@ fn gemini_tool_body(req: &ChatCompletionRequest) -> Result<serde_json::Value, Co
 }
 
 pub(crate) fn validate_gemini_tool_request(req: &ChatCompletionRequest) -> Result<(), String> {
-    gemini_tool_body(req).map(|_| ()).map_err(|error| error.to_string())
+    google_tool_body(req, "Gemini").map(|_| ()).map_err(|error| error.to_string())
 }
 
-fn map_gemini_tool_response(gr: GeminiResp, model: &str) -> Result<ChatCompletionResponse, ConnectorError> {
+pub(crate) fn map_google_tool_response(gr: GeminiResp, model: &str, provider: &str) -> Result<ChatCompletionResponse, ConnectorError> {
     use serde_json::json;
     use std::collections::HashSet;
-    let candidate = gr.candidates.first().ok_or_else(|| ConnectorError::BadResponse("Gemini returned no candidates".into()))?;
+    let candidate = gr.candidates.first().ok_or_else(|| ConnectorError::BadResponse(format!("{provider} returned no candidates")))?;
     let mut text = String::new();
     let mut tool_calls = Vec::new();
     let mut names = HashSet::new();
@@ -872,36 +872,44 @@ fn map_gemini_tool_response(gr: GeminiResp, model: &str) -> Result<ChatCompletio
             (Some(value), None) => text.push_str(value),
             (None, Some(call)) => {
                 if !names.insert(call.name.as_str()) {
-                    return Err(ConnectorError::BadResponse("Gemini connector cannot disambiguate repeated calls to the same function in one turn".into()));
+                    return Err(ConnectorError::BadResponse(format!("{provider} connector cannot disambiguate repeated calls to the same function in one turn")));
                 }
                 let args = call.args.clone().unwrap_or_else(|| json!({}));
-                if !args.is_object() { return Err(ConnectorError::BadResponse("Gemini functionCall args must be an object".into())); }
+                if !args.is_object() { return Err(ConnectorError::BadResponse(format!("{provider} functionCall args must be an object"))); }
                 let id = call.id.as_deref().filter(|s| !s.is_empty())
                     .map(str::to_string).unwrap_or_else(|| format!("call_{}", uuid::Uuid::new_v4()));
-                if !ids.insert(id.clone()) { return Err(ConnectorError::BadResponse("Gemini returned duplicate function call IDs".into())); }
+                if !ids.insert(id.clone()) { return Err(ConnectorError::BadResponse(format!("{provider} returned duplicate function call IDs"))); }
                 tool_calls.push(json!({"id":id,"type":"function","function":{"name":call.name,"arguments":args.to_string()}}));
             }
-            _ => return Err(ConnectorError::BadResponse("Unsupported Gemini response part".into())),
+            _ => return Err(ConnectorError::BadResponse(format!("Unsupported {provider} response part"))),
         }
     }
     let finish = match (candidate.finish_reason.as_deref(), tool_calls.is_empty()) {
         (Some("STOP"), false) => "tool_calls",
         (Some("STOP"), true) => "stop",
         (Some("MAX_TOKENS"), true) => "length",
-        _ => return Err(ConnectorError::BadResponse("Gemini finish reason and function calls cannot be mapped safely".into())),
+        _ => return Err(ConnectorError::BadResponse(format!("{provider} finish reason and function calls cannot be mapped safely"))),
     };
     let (prompt_tokens, completion_tokens) = gr.usage_metadata
         .map(|usage| (usage.prompt_token_count, usage.candidates_token_count)).unwrap_or((0,0));
     let content = if text.is_empty() && !tool_calls.is_empty() { crate::vision::MessageContent::Null }
         else { crate::vision::MessageContent::Text(text) };
     Ok(ChatCompletionResponse {
-        id: format!("gemini-{}", uuid::Uuid::new_v4()), object: "chat.completion".into(),
+        id: format!("{}-{}", provider.to_ascii_lowercase(), uuid::Uuid::new_v4()), object: "chat.completion".into(),
         created: unix_now(), model: model.to_string(),
         choices: vec![Choice { index: 0, message: ChatMessage { role: "assistant".into(), content,
             tool_calls: (!tool_calls.is_empty()).then_some(tool_calls), tool_call_id: None, name: None },
             finish_reason: finish.into() }],
         usage: Usage { prompt_tokens, completion_tokens, total_tokens: prompt_tokens + completion_tokens },
     })
+}
+
+fn gemini_tool_body(req: &ChatCompletionRequest) -> Result<serde_json::Value, ConnectorError> {
+    google_tool_body(req, "Gemini")
+}
+
+fn map_gemini_tool_response(gr: GeminiResp, model: &str) -> Result<ChatCompletionResponse, ConnectorError> {
+    map_google_tool_response(gr, model, "Gemini")
 }
 
 pub struct GeminiConnector {
