@@ -688,6 +688,15 @@ struct GeminiRespContent {
 #[derive(Debug, Deserialize)]
 struct GeminiRespPart {
     text: Option<String>,
+    #[serde(rename = "functionCall")]
+    function_call: Option<GeminiFunctionCall>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GeminiFunctionCall {
+    id: Option<String>,
+    name: String,
+    args: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -743,14 +752,167 @@ pub fn to_gemini_body(req: &ChatCompletionRequest) -> serde_json::Value {
     body
 }
 
+fn gemini_tool_body(req: &ChatCompletionRequest) -> Result<serde_json::Value, ConnectorError> {
+    use serde_json::{json, Value};
+    use std::collections::{HashMap, HashSet};
+    let bad = |message: &str| ConnectorError::BadResponse(message.to_string());
+    if req.parallel_tool_calls == Some(false) {
+        return Err(bad("parallel_tool_calls: false is not supported by the Gemini connector"));
+    }
+    let mut declarations = Vec::new();
+    let mut declared_names = HashSet::new();
+    for tool in req.tools.as_deref().unwrap_or(&[]) {
+        if tool.get("type").and_then(Value::as_str) != Some("function") {
+            return Err(bad("Gemini connector supports only function tools"));
+        }
+        let function = tool.get("function").ok_or_else(|| bad("Function tool is missing function"))?;
+        if function.get("strict") == Some(&Value::Bool(true)) || tool.get("strict") == Some(&Value::Bool(true)) {
+            return Err(bad("Strict-mode tool schemas aren't supported through the Gemini connector yet"));
+        }
+        if function.get("strict").is_some() && function.get("strict") != Some(&Value::Bool(false)) {
+            return Err(bad("Function strict must be a boolean"));
+        }
+        let name = function.get("name").and_then(Value::as_str).filter(|s| !s.is_empty())
+            .ok_or_else(|| bad("Function tool is missing a name"))?;
+        if !declared_names.insert(name.to_string()) { return Err(bad("Duplicate function definition name")); }
+        let schema = function.get("parameters").filter(|v| v.is_object())
+            .ok_or_else(|| bad("Function parameters must be a JSON object"))?;
+        let mut declaration = json!({"name":name,"parametersJsonSchema":schema});
+        if let Some(description) = function.get("description") {
+            if !description.is_string() { return Err(bad("Function description must be a string")); }
+            declaration["description"] = description.clone();
+        }
+        declarations.push(declaration);
+    }
+
+    let tool_config = match req.tool_choice.as_ref() {
+        None => None,
+        Some(Value::String(s)) if s == "auto" => Some(json!({"functionCallingConfig":{"mode":"AUTO"}})),
+        Some(Value::String(s)) if s == "none" => Some(json!({"functionCallingConfig":{"mode":"NONE"}})),
+        Some(Value::String(s)) if s == "required" => Some(json!({"functionCallingConfig":{"mode":"ANY"}})),
+        Some(value) if value.get("type").and_then(Value::as_str) == Some("function") => {
+            let name = value.pointer("/function/name").and_then(Value::as_str)
+                .ok_or_else(|| bad("Named tool choice is missing function.name"))?;
+            if !declared_names.contains(name) { return Err(bad("Named tool choice is not in the tools list")); }
+            Some(json!({"functionCallingConfig":{"mode":"ANY","allowedFunctionNames":[name]}}))
+        }
+        _ => return Err(bad("Unsupported tool_choice for Gemini connector")),
+    };
+    if declarations.is_empty() && req.tool_choice.as_ref().is_some_and(|v| v != "none") {
+        return Err(bad("tool_choice requires at least one function tool"));
+    }
+
+    let mut body = to_gemini_body(req);
+    let mut contents = Vec::new();
+    let mut call_names: HashMap<String, String> = HashMap::new();
+    for message in &req.messages {
+        if message.role == "system" { continue; }
+        if message.name.is_some() { return Err(bad("Named messages are not supported by the Gemini connector")); }
+        if message.role == "tool" {
+            let id = message.tool_call_id.as_deref().ok_or_else(|| bad("Tool result is missing tool_call_id"))?;
+            let name = call_names.remove(id).ok_or_else(|| bad("Tool result has no matching prior assistant tool call"))?;
+            if !matches!(message.content, crate::vision::MessageContent::Text(_)) {
+                return Err(bad("Gemini tool results currently require text content"));
+            }
+            contents.push(json!({"role":"user","parts":[{"functionResponse":{
+                "id":id,"name":name,"response":{"output":message.content.as_text()}}}]}));
+            continue;
+        }
+        if message.tool_call_id.is_some() { return Err(bad("tool_call_id is only valid on tool messages")); }
+        let mm = crate::vision::MultimodalMessage { role: message.role.clone(), content: message.content.clone() };
+        let mut converted = crate::vision::to_gemini_content(&mm);
+        if let Some(calls) = &message.tool_calls {
+            if message.role != "assistant" { return Err(bad("tool_calls are only valid on assistant messages")); }
+            let mut parts = match &message.content {
+                crate::vision::MessageContent::Text(text) if !text.is_empty() => vec![json!({"text":text})],
+                crate::vision::MessageContent::Null => Vec::new(),
+                _ => return Err(bad("Assistant tool calls currently require text or null content")),
+            };
+            let mut names_this_turn = HashSet::new();
+            for call in calls {
+                let id = call.get("id").and_then(Value::as_str).filter(|s| !s.is_empty())
+                    .ok_or_else(|| bad("Tool call is missing id"))?;
+                if call.get("type").and_then(Value::as_str) != Some("function") { return Err(bad("Only function tool calls are supported")); }
+                let name = call.pointer("/function/name").and_then(Value::as_str)
+                    .ok_or_else(|| bad("Tool call is missing function.name"))?;
+                if !names_this_turn.insert(name.to_string()) {
+                    return Err(bad("Gemini connector cannot disambiguate repeated calls to the same function in one turn"));
+                }
+                let args = call.pointer("/function/arguments").and_then(Value::as_str)
+                    .ok_or_else(|| bad("Tool call arguments must be a JSON string"))?;
+                let parsed: Value = serde_json::from_str(args).map_err(|_| bad("Tool call arguments must contain valid JSON"))?;
+                if !parsed.is_object() { return Err(bad("Gemini function arguments must be a JSON object")); }
+                if call_names.insert(id.to_string(), name.to_string()).is_some() { return Err(bad("Duplicate tool call ID")); }
+                parts.push(json!({"functionCall":{"id":id,"name":name,"args":parsed}}));
+            }
+            converted["parts"] = json!(parts);
+        }
+        contents.push(converted);
+    }
+    body["contents"] = json!(contents);
+    if !declarations.is_empty() { body["tools"] = json!([{"functionDeclarations":declarations}]); }
+    if let Some(config) = tool_config { body["toolConfig"] = config; }
+    Ok(body)
+}
+
+pub(crate) fn validate_gemini_tool_request(req: &ChatCompletionRequest) -> Result<(), String> {
+    gemini_tool_body(req).map(|_| ()).map_err(|error| error.to_string())
+}
+
+fn map_gemini_tool_response(gr: GeminiResp, model: &str) -> Result<ChatCompletionResponse, ConnectorError> {
+    use serde_json::json;
+    use std::collections::HashSet;
+    let candidate = gr.candidates.first().ok_or_else(|| ConnectorError::BadResponse("Gemini returned no candidates".into()))?;
+    let mut text = String::new();
+    let mut tool_calls = Vec::new();
+    let mut names = HashSet::new();
+    let mut ids = HashSet::new();
+    for part in &candidate.content.parts {
+        match (&part.text, &part.function_call) {
+            (Some(value), None) => text.push_str(value),
+            (None, Some(call)) => {
+                if !names.insert(call.name.as_str()) {
+                    return Err(ConnectorError::BadResponse("Gemini connector cannot disambiguate repeated calls to the same function in one turn".into()));
+                }
+                let args = call.args.clone().unwrap_or_else(|| json!({}));
+                if !args.is_object() { return Err(ConnectorError::BadResponse("Gemini functionCall args must be an object".into())); }
+                let id = call.id.as_deref().filter(|s| !s.is_empty())
+                    .map(str::to_string).unwrap_or_else(|| format!("call_{}", uuid::Uuid::new_v4()));
+                if !ids.insert(id.clone()) { return Err(ConnectorError::BadResponse("Gemini returned duplicate function call IDs".into())); }
+                tool_calls.push(json!({"id":id,"type":"function","function":{"name":call.name,"arguments":args.to_string()}}));
+            }
+            _ => return Err(ConnectorError::BadResponse("Unsupported Gemini response part".into())),
+        }
+    }
+    let finish = match (candidate.finish_reason.as_deref(), tool_calls.is_empty()) {
+        (Some("STOP"), false) => "tool_calls",
+        (Some("STOP"), true) => "stop",
+        (Some("MAX_TOKENS"), true) => "length",
+        _ => return Err(ConnectorError::BadResponse("Gemini finish reason and function calls cannot be mapped safely".into())),
+    };
+    let (prompt_tokens, completion_tokens) = gr.usage_metadata
+        .map(|usage| (usage.prompt_token_count, usage.candidates_token_count)).unwrap_or((0,0));
+    let content = if text.is_empty() && !tool_calls.is_empty() { crate::vision::MessageContent::Null }
+        else { crate::vision::MessageContent::Text(text) };
+    Ok(ChatCompletionResponse {
+        id: format!("gemini-{}", uuid::Uuid::new_v4()), object: "chat.completion".into(),
+        created: unix_now(), model: model.to_string(),
+        choices: vec![Choice { index: 0, message: ChatMessage { role: "assistant".into(), content,
+            tool_calls: (!tool_calls.is_empty()).then_some(tool_calls), tool_call_id: None, name: None },
+            finish_reason: finish.into() }],
+        usage: Usage { prompt_tokens, completion_tokens, total_tokens: prompt_tokens + completion_tokens },
+    })
+}
+
 pub struct GeminiConnector {
     client: reqwest::Client,
     circuit_breaker: Arc<CircuitBreaker>,
+    base_url: String,
 }
 
 impl GeminiConnector {
     pub fn new(circuit_breaker: Arc<CircuitBreaker>) -> Self {
-        Self { client: build_client(), circuit_breaker }
+        Self { client: build_client(), circuit_breaker, base_url: provider_base_url(Provider::Gemini).into() }
     }
 }
 
@@ -762,22 +924,17 @@ impl Connector for GeminiConnector {
         req: &ChatCompletionRequest,
         client_api_key: &str,
     ) -> Result<ConnectorResult, ConnectorError> {
-        if has_tool_payload(req) {
-            return Err(ConnectorError::BadResponse(
-                "OpenAI-format tools are not yet supported on the Gemini connector".into(),
-            ));
-        }
         let start = Instant::now();
 
         if self.circuit_breaker.is_open(Provider::Gemini) {
             return Err(ConnectorError::CircuitOpen);
         }
 
-        let body = to_gemini_body(req);
+        let body = if has_tool_payload(req) { gemini_tool_body(req)? } else { to_gemini_body(req) };
 
         let url = format!(
             "{}/{}:generateContent",
-            provider_base_url(Provider::Gemini),
+            self.base_url,
             req.model
         );
 
@@ -823,6 +980,16 @@ impl Connector for GeminiConnector {
                 let gr: GeminiResp = serde_json::from_str(&text).map_err(|e| {
                     ConnectorError::BadResponse(format!("Provider returned unexpected response format: {e}"))
                 })?;
+                if has_tool_payload(req) {
+                    let response = map_gemini_tool_response(gr, &req.model)?;
+                    self.circuit_breaker.record_success(Provider::Gemini);
+                    return Ok(ConnectorResult {
+                        provider: Provider::Gemini, model_id: req.model.clone(),
+                        input_tokens: response.usage.prompt_tokens,
+                        output_tokens: response.usage.completion_tokens,
+                        latency_ms: start.elapsed().as_millis() as u64, response,
+                    });
+                }
                 let content = gr
                     .candidates
                     .first()
@@ -1431,6 +1598,108 @@ mod tests {
         })]);
         request.tool_choice = Some(serde_json::json!("auto"));
         request
+    }
+
+    fn gemini_req() -> ChatCompletionRequest {
+        let mut request = req("gemini-2.5-flash");
+        request.tools = Some(vec![serde_json::json!({"type":"function","function":{
+            "name":"get_weather","description":"Weather by city",
+            "parameters":{"type":"object","properties":{"city":{"type":"string"}}}
+        }})]);
+        request.tool_choice = Some(serde_json::json!("auto"));
+        request
+    }
+
+    #[test]
+    fn gemini_rejects_strict_parallel_false_and_ambiguous_same_name() {
+        let mut request = gemini_req();
+        request.tools.as_mut().unwrap()[0]["function"]["strict"] = serde_json::json!(true);
+        assert!(validate_gemini_tool_request(&request).unwrap_err().contains("Strict-mode"));
+        request.tools.as_mut().unwrap()[0]["function"]["strict"] = serde_json::json!(false);
+        request.parallel_tool_calls = Some(false);
+        assert!(validate_gemini_tool_request(&request).unwrap_err().contains("parallel_tool_calls"));
+        request.parallel_tool_calls = None;
+        request.messages.push(serde_json::from_value(serde_json::json!({
+            "role":"assistant","content":null,"tool_calls":[
+                {"id":"call_a","type":"function","function":{"name":"get_weather","arguments":"{}"}},
+                {"id":"call_b","type":"function","function":{"name":"get_weather","arguments":"{}"}}
+            ]
+        })).unwrap());
+        assert!(validate_gemini_tool_request(&request).unwrap_err().contains("repeated calls to the same function"));
+
+        let repeated: GeminiResp = serde_json::from_value(serde_json::json!({
+            "candidates":[{"content":{"parts":[
+                {"functionCall":{"name":"get_weather","args":{}}},
+                {"functionCall":{"name":"get_weather","args":{}}}
+            ]},"finishReason":"STOP"}]
+        })).unwrap();
+        assert!(map_gemini_tool_response(repeated, "gemini-2.5-flash").unwrap_err().to_string().contains("repeated calls to the same function"));
+    }
+
+    #[test]
+    fn gemini_maps_named_choice_and_preserves_provider_call_id() {
+        let mut request = gemini_req();
+        request.tool_choice = Some(serde_json::json!({"type":"function","function":{"name":"get_weather"}}));
+        let body = gemini_tool_body(&request).unwrap();
+        assert_eq!(body["toolConfig"]["functionCallingConfig"]["mode"], "ANY");
+        assert_eq!(body["toolConfig"]["functionCallingConfig"]["allowedFunctionNames"][0], "get_weather");
+        let provider: GeminiResp = serde_json::from_value(serde_json::json!({
+            "candidates":[{"content":{"parts":[{"functionCall":{
+                "id":"provider_call_1","name":"get_weather","args":{"city":"Dubai"}}}]},"finishReason":"STOP"}]
+        })).unwrap();
+        let mapped = map_gemini_tool_response(provider, "gemini-2.5-flash").unwrap();
+        assert_eq!(mapped.choices[0].message.tool_calls.as_ref().unwrap()[0]["id"], "provider_call_1");
+
+        request.messages.push(serde_json::from_value(serde_json::json!({
+            "role":"assistant","content":null,"tool_calls":[{"id":"call_bad","type":"function",
+                "function":{"name":"get_weather","arguments":"not JSON"}}]
+        })).unwrap());
+        assert!(validate_gemini_tool_request(&request).unwrap_err().contains("valid JSON"));
+    }
+
+    #[tokio::test]
+    async fn gemini_tool_call_result_and_answer_complete_over_mock_http() {
+        use axum::{routing::post, Json, Router};
+        use parking_lot::Mutex;
+        let seen = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let capture = Arc::clone(&seen);
+        let app = Router::new().route("/models/gemini-2.5-flash:generateContent", post(move |Json(body): Json<serde_json::Value>| {
+            let capture = Arc::clone(&capture);
+            async move {
+                let followup = body["contents"].as_array().unwrap().len() > 1;
+                capture.lock().push(body);
+                if followup {
+                    Json(serde_json::json!({"candidates":[{"content":{"parts":[{"text":"It is sunny."}]},"finishReason":"STOP"}],
+                        "usageMetadata":{"promptTokenCount":30,"candidatesTokenCount":5}}))
+                } else {
+                    Json(serde_json::json!({"candidates":[{"content":{"parts":[{"functionCall":{
+                        "name":"get_weather","args":{"city":"Dubai"}}}]},"finishReason":"STOP"}],
+                        "usageMetadata":{"promptTokenCount":20,"candidatesTokenCount":8}}))
+                }
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let mut connector = GeminiConnector::new(Arc::new(CircuitBreaker::new()));
+        connector.base_url = format!("http://{address}/models");
+        let mut request = gemini_req();
+        let first = connector.complete(&request, "local-test-key").await.unwrap();
+        assert_eq!(first.response.choices[0].finish_reason, "tool_calls");
+        let call = first.response.choices[0].message.tool_calls.as_ref().unwrap()[0].clone();
+        assert!(call["id"].as_str().unwrap().starts_with("call_"));
+        assert_eq!(call["function"]["arguments"], "{\"city\":\"Dubai\"}");
+        request.messages.push(first.response.choices[0].message.clone());
+        request.messages.push(serde_json::from_value(serde_json::json!({
+            "role":"tool","tool_call_id":call["id"],"content":"sunny"
+        })).unwrap());
+        let second = connector.complete(&request, "local-test-key").await.unwrap();
+        assert_eq!(second.response.choices[0].message.content.as_text(), "It is sunny.");
+        let captured = seen.lock();
+        assert_eq!(captured[0]["tools"][0]["functionDeclarations"][0]["name"], "get_weather");
+        assert_eq!(captured[1]["contents"][1]["parts"][0]["functionCall"]["id"], call["id"]);
+        assert_eq!(captured[1]["contents"][2]["parts"][0]["functionResponse"]["id"], call["id"]);
+        assert_eq!(captured[1]["contents"][2]["parts"][0]["functionResponse"]["response"]["output"], "sunny");
     }
 
     #[test]
