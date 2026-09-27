@@ -283,8 +283,12 @@ fn validate_tool_wire(request: &ChatCompletionRequest, provider: Provider) -> Re
     if connectors::has_tool_payload(request) && provider == Provider::Anthropic {
         connectors::validate_anthropic_tool_request(request).map_err(ApiError::BadRequest)?;
     }
+    if connectors::has_tool_payload(request) && provider == Provider::Gemini && !request.stream.unwrap_or(false) {
+        connectors::validate_gemini_tool_request(request).map_err(ApiError::BadRequest)?;
+    }
     if connectors::has_tool_payload(request)
-        && matches!(provider, Provider::Gemini | Provider::VertexAI | Provider::Bedrock)
+        && (matches!(provider, Provider::VertexAI | Provider::Bedrock)
+            || (provider == Provider::Gemini && request.stream.unwrap_or(false)))
     {
         return Err(ApiError::BadRequest(format!(
             "OpenAI-format tool calls are not supported by the {provider} connector. Use an OpenAI-compatible provider or Anthropic's native /v1/messages endpoint."
@@ -471,6 +475,7 @@ fn resolve_model(
         ];
         let mut allowed: HashSet<_> = tool_wire_providers.into_iter().collect();
         allowed.insert(Provider::Anthropic);
+        if !request.stream.unwrap_or(false) { allowed.insert(Provider::Gemini); }
         match &mut reachable {
             Some(providers) => providers.retain(|provider| allowed.contains(provider)),
             None => reachable = Some(allowed),
@@ -1581,5 +1586,19 @@ mod request_safety_tests {
         assert!(validate_tool_wire(&request, Provider::Anthropic).is_ok());
         request.tools.as_mut().unwrap()[0]["function"]["strict"] = json!(true);
         assert!(matches!(validate_tool_wire(&request, Provider::Anthropic), Err(ApiError::BadRequest(_))));
+    }
+
+    #[test]
+    fn gemini_tool_wire_is_non_streaming_only() {
+        let mut request = request(json!([{ "role": "user", "content": "Weather in Dubai" }]));
+        request.tools = Some(vec![json!({"type":"function","function":{
+            "name":"get_weather","parameters":{"type":"object","properties":{}}
+        }})]);
+        assert!(validate_tool_wire(&request, Provider::Gemini).is_ok());
+        request.stream = Some(true);
+        assert!(matches!(validate_tool_wire(&request, Provider::Gemini), Err(ApiError::BadRequest(_))));
+        request.stream = None;
+        request.tools.as_mut().unwrap()[0]["function"]["strict"] = json!(true);
+        assert!(matches!(validate_tool_wire(&request, Provider::Gemini), Err(ApiError::BadRequest(_))));
     }
 }

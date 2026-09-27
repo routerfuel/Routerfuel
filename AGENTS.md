@@ -4,7 +4,7 @@ RouterFuel is a self-hosted, BYOK Rust gateway (Axum, sqlx/Postgres, pgvector). 
 
 ## Shipped on `feat/voice-agent-foundation`
 
-- Tool calls are supported through OpenAI-compatible connectors and the Anthropic connector on `/v1/chat/completions`, including Anthropic streaming SSE translation. Native Anthropic `/v1/messages` supports its own format. Anthropic strict-mode schemas remain rejected. Gemini, Vertex, and Bedrock translation is not implemented. Do not claim all providers support tool calls on the OpenAI-shaped path or that Anthropic streaming has had a paid live-provider verification.
+- Tool calls are supported through OpenAI-compatible connectors and the Anthropic connector on `/v1/chat/completions`, including Anthropic streaming SSE translation. Native Anthropic `/v1/messages` supports its own format. Gemini ordinary function tools are translated only on the non-streaming OpenAI-shaped path; streaming, strict mode, and repeated same-name calls in one turn remain rejected. Vertex and Bedrock translation is not implemented. Do not claim Gemini has had a paid live-provider verification.
 - Semantic cache eligibility is limited to a safe single plain-text user turn with default settings; tool, conversation, shadow, and compression traffic bypass it. Tool-compatible routing is filtered accordingly.
 - Migrations 011 and 012 add `client_tiers.organization_id` and snapshot it into `request_logs`. A stable organization may own multiple API-key hashes. Existing and env-only keys default to their own hash. `client_id` remains the individual key hash for auth, revocation, rate limiting, and current spend guards. Do not use `client_name`, `notes`, or a caller-supplied header as an authorization identity.
 
