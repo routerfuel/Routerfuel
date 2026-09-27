@@ -1,6 +1,6 @@
 use crate::circuit_breaker::CircuitBreaker;
 use crate::connectors::{
-    to_gemini_body, ChatCompletionRequest, ChatCompletionResponse, ChatMessage, Choice, Connector,
+    google_tool_body, map_google_tool_response, to_gemini_body, ChatCompletionRequest, ChatCompletionResponse, ChatMessage, Choice, Connector,
     ConnectorError, ConnectorResult, Provider, Usage,
 };
 use async_trait::async_trait;
@@ -290,18 +290,17 @@ impl Connector for VertexConnector {
         req: &ChatCompletionRequest,
         raw: &str,
     ) -> Result<ConnectorResult, ConnectorError> {
-        if crate::connectors::has_tool_payload(req) {
-            return Err(ConnectorError::BadResponse(
-                "OpenAI-format tools are not yet supported on the Vertex connector".into(),
-            ));
-        }
         let started = Instant::now();
         if self.circuit_breaker.is_open(Provider::VertexAI) {
             return Err(ConnectorError::CircuitOpen);
         }
         let connection = Self::parse_connection(raw)?;
         let url = Self::url(&connection, &req.model, false)?;
-        let body = to_gemini_body(req);
+        let has_tools = crate::connectors::has_tool_payload(req);
+        if has_tools && req.stream.unwrap_or(false) {
+            return Err(ConnectorError::BadResponse("Streaming tool calls are not supported by the Vertex connector".into()));
+        }
+        let body = if has_tools { google_tool_body(req, "Vertex")? } else { to_gemini_body(req) };
         let mut auth = self.auth(&connection, false).await?;
         let mut response = self.request(&url, &auth).json(&body).send().await?;
         if response.status().as_u16() == 401 && matches!(auth, VertexAuth::Bearer(_)) {
@@ -324,6 +323,20 @@ impl Connector for VertexConnector {
             return Err(ConnectorError::BadResponse(format!(
                 "HTTP {status}: {text}"
             )));
+        }
+        if has_tools {
+            let parsed: crate::connectors::GeminiResp = serde_json::from_str(&text)
+                .map_err(|e| ConnectorError::BadResponse(format!("Unexpected Vertex response: {e}")))?;
+            let mapped = map_google_tool_response(parsed, &req.model, "Vertex")?;
+            self.circuit_breaker.record_success(Provider::VertexAI);
+            return Ok(ConnectorResult {
+                provider: Provider::VertexAI,
+                model_id: req.model.clone(),
+                input_tokens: mapped.usage.prompt_tokens,
+                output_tokens: mapped.usage.completion_tokens,
+                latency_ms: started.elapsed().as_millis() as u64,
+                response: mapped,
+            });
         }
         let parsed: VertexResponse = serde_json::from_str(&text)
             .map_err(|e| ConnectorError::BadResponse(format!("Unexpected Vertex response: {e}")))?;
@@ -388,6 +401,75 @@ fn unix_now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    fn tool_request() -> ChatCompletionRequest {
+        serde_json::from_value(json!({
+            "model":"gemini-2.5-pro",
+            "messages":[{"role":"user","content":"Weather in Dubai?"}],
+            "tools":[{"type":"function","function":{"name":"get_weather",
+                "parameters":{"type":"object","properties":{"city":{"type":"string"}}}}}],
+            "tool_choice":{"type":"function","function":{"name":"get_weather"}}
+        })).unwrap()
+    }
+
+    #[test]
+    fn vertex_mock_tool_cycle() {
+        let mut request = tool_request();
+        let first_body = google_tool_body(&request, "Vertex").unwrap();
+        assert_eq!(first_body["tools"][0]["functionDeclarations"][0]["name"], "get_weather");
+        assert_eq!(first_body["toolConfig"]["functionCallingConfig"]["mode"], "ANY");
+        let provider = serde_json::from_value(json!({
+            "candidates":[{"content":{"parts":[{"text":"Checking."},{"functionCall":{
+                "id":"vertex_call_1","name":"get_weather","args":{"city":"Dubai"}}}]},
+                "finishReason":"STOP"}],
+            "usageMetadata":{"promptTokenCount":20,"candidatesTokenCount":8}
+        })).unwrap();
+        let mapped = map_google_tool_response(provider, &request.model, "Vertex").unwrap();
+        assert_eq!(mapped.choices[0].finish_reason, "tool_calls");
+        assert_eq!(mapped.choices[0].message.content.as_text(), "Checking.");
+        let call = &mapped.choices[0].message.tool_calls.as_ref().unwrap()[0];
+        assert_eq!(call["id"], "vertex_call_1");
+        assert_eq!(call["function"]["arguments"], "{\"city\":\"Dubai\"}");
+        request.messages.push(mapped.choices[0].message.clone());
+        request.messages.push(serde_json::from_value(json!({
+            "role":"tool","tool_call_id":"vertex_call_1","content":"Sunny, 34 C"
+        })).unwrap());
+        let second_body = google_tool_body(&request, "Vertex").unwrap();
+        assert_eq!(second_body["contents"][1]["parts"][1]["functionCall"]["id"], "vertex_call_1");
+        assert_eq!(second_body["contents"][2]["parts"][0]["functionResponse"]["id"], "vertex_call_1");
+        assert_eq!(second_body["contents"][2]["parts"][0]["functionResponse"]["response"]["output"], "Sunny, 34 C");
+        let final_answer = serde_json::from_value(json!({
+            "candidates":[{"content":{"parts":[{"text":"It is sunny in Dubai."}]},"finishReason":"STOP"}]
+        })).unwrap();
+        let mapped = map_google_tool_response(final_answer, &request.model, "Vertex").unwrap();
+        assert_eq!(mapped.choices[0].finish_reason, "stop");
+        assert_eq!(mapped.choices[0].message.content.as_text(), "It is sunny in Dubai.");
+    }
+
+    #[test]
+    fn vertex_rejects_unmappable_tool_shapes() {
+        let mut request = tool_request();
+        request.tools.as_mut().unwrap()[0]["function"]["strict"] = json!(true);
+        assert!(google_tool_body(&request, "Vertex").unwrap_err().to_string().contains("Strict-mode"));
+        request.tools.as_mut().unwrap()[0]["function"]["strict"] = json!(false);
+        request.messages.push(serde_json::from_value(json!({"role":"assistant","content":null,
+            "tool_calls":[{"id":"a","type":"function","function":{"name":"get_weather","arguments":"oops"}}]})).unwrap());
+        assert!(google_tool_body(&request, "Vertex").unwrap_err().to_string().contains("valid JSON"));
+        request.messages.pop();
+        request.messages.push(serde_json::from_value(json!({"role":"assistant","content":null,
+            "tool_calls":[
+                {"id":"a","type":"function","function":{"name":"get_weather","arguments":"{}"}},
+                {"id":"b","type":"function","function":{"name":"get_weather","arguments":"{}"}}]})).unwrap());
+        assert!(google_tool_body(&request, "Vertex").unwrap_err().to_string().contains("repeated calls"));
+        let repeated = serde_json::from_value(json!({"candidates":[{"content":{"parts":[
+            {"functionCall":{"name":"get_weather","args":{}}},
+            {"functionCall":{"name":"get_weather","args":{}}}]},"finishReason":"STOP"}]})).unwrap();
+        assert!(map_google_tool_response(repeated, &request.model, "Vertex").unwrap_err().to_string().contains("repeated calls"));
+        let malformed = serde_json::from_value(json!({"candidates":[{"content":{"parts":[
+            {"functionCall":{"name":"get_weather","args":[1]}}]},"finishReason":"STOP"}]})).unwrap();
+        assert!(map_google_tool_response(malformed, &request.model, "Vertex").unwrap_err().to_string().contains("must be an object"));
+    }
     #[test]
     fn parses_testing_api_key_connection() {
         let parsed =
