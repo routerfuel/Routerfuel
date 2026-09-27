@@ -6,6 +6,7 @@
 mod admin;
 mod auth;
 mod bedrock_catalog;
+mod bedrock;
 mod circuit_breaker;
 mod client_registry;
 mod concurrency;
@@ -290,17 +291,15 @@ fn validate_tool_wire(request: &ChatCompletionRequest, provider: Provider) -> Re
         connectors::google_tool_body(request, if provider == Provider::VertexAI { "Vertex" } else { "Gemini" })
             .map_err(|error| ApiError::BadRequest(error.to_string()))?;
     }
+    if connectors::has_tool_payload(request) && provider == Provider::Bedrock && !request.stream.unwrap_or(false) {
+        bedrock::validate_tool_request(request).map_err(ApiError::BadRequest)?;
+    }
     if connectors::has_tool_payload(request)
-        && (provider == Provider::Bedrock
-            || (matches!(provider, Provider::Gemini | Provider::VertexAI) && request.stream.unwrap_or(false)))
+        && matches!(provider, Provider::Bedrock | Provider::Gemini | Provider::VertexAI)
+        && request.stream.unwrap_or(false)
     {
-        if provider != Provider::Bedrock {
-            return Err(ApiError::BadRequest(format!(
-                "Streaming tool calls are not supported by the {provider} connector"
-            )));
-        }
         return Err(ApiError::BadRequest(format!(
-            "OpenAI-format tool calls are not supported by the {provider} connector. Use an OpenAI-compatible provider or Anthropic's native /v1/messages endpoint."
+            "Streaming tool calls are not supported by the {provider} connector"
         )));
     }
     Ok(())
@@ -487,6 +486,7 @@ fn resolve_model(
         if !request.stream.unwrap_or(false) {
             allowed.insert(Provider::Gemini);
             allowed.insert(Provider::VertexAI);
+            allowed.insert(Provider::Bedrock);
         }
         match &mut reachable {
             Some(providers) => providers.retain(|provider| allowed.contains(provider)),
@@ -1626,5 +1626,20 @@ mod request_safety_tests {
         request.stream = None;
         request.tools.as_mut().unwrap()[0]["function"]["strict"] = json!(true);
         assert!(matches!(validate_tool_wire(&request, Provider::VertexAI), Err(ApiError::BadRequest(_))));
+    }
+
+    #[test]
+    fn bedrock_tool_wire_is_scoped_and_non_streaming_only() {
+        let mut request = request(json!([{ "role": "user", "content": "Weather in Dubai" }]));
+        request.model = "anthropic.claude-3-sonnet-20240229-v1:0".into();
+        request.tools = Some(vec![json!({"type":"function","function":{
+            "name":"get_weather","parameters":{"type":"object","properties":{}}
+        }})]);
+        assert!(validate_tool_wire(&request, Provider::Bedrock).is_ok());
+        request.stream = Some(true);
+        assert!(matches!(validate_tool_wire(&request, Provider::Bedrock), Err(ApiError::BadRequest(_))));
+        request.stream = None;
+        request.model = "meta.llama3-70b-instruct-v1:0".into();
+        assert!(matches!(validate_tool_wire(&request, Provider::Bedrock), Err(ApiError::BadRequest(_))));
     }
 }

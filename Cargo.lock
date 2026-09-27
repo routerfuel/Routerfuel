@@ -2163,6 +2163,7 @@ dependencies = [
  "futures",
  "futures-util",
  "governor",
+ "hmac",
  "hyper",
  "jsonwebtoken",
  "lazy_static",

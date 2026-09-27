@@ -1181,78 +1181,12 @@ impl Connector for BedrockConnector {
         req: &ChatCompletionRequest,
         client_api_key: &str,
     ) -> Result<ConnectorResult, ConnectorError> {
-        // client_api_key for Bedrock is expected to be in the format:
-        // "region=us-east-1;access_key=AKIA...;secret_key=..."
-        // or "region=us-east-1;profile=default" (uses AWS credentials file)
-        let (region, access_key, secret_key, session_token) = parse_bedrock_connection(client_api_key)?;
-
-        let url = format!(
-            "https://bedrock-runtime.{}.amazonaws.com/model/{}/invoke",
-            region,
-            req.model
-        );
-
-        let body = build_openai_compatible_body(req);
-
-        // Build SigV4 signed request
-        let mut builder = self.client.post(&url).header("content-type", "application/json");
-
-        // In production, this would use aws-sigv4 crate for proper signing.
-        // For now, pass credentials as headers (Bedrock also supports this for testing).
-        builder = builder
-            .header("x-amz-access-key", &access_key)
-            .header("x-amz-secret-key", &secret_key);
-        if let Some(token) = &session_token {
-            builder = builder.header("x-amz-security-token", token);
-        }
-
-        openai_compatible_call_with_builder(
-            builder,
-            &body,
-            req,
-            Provider::Bedrock,
-            &self.circuit_breaker,
-        )
-        .await
+        crate::bedrock::complete(&self.client, &self.circuit_breaker, req, client_api_key).await
     }
 
     fn provider(&self) -> Provider {
         Provider::Bedrock
     }
-}
-
-fn parse_bedrock_connection(
-    conn_str: &str,
-) -> Result<(String, String, String, Option<String>), ConnectorError> {
-    let mut region = None;
-    let mut access_key = None;
-    let mut secret_key = None;
-    let mut session_token = None;
-
-    for part in conn_str.split(';') {
-        let part = part.trim();
-        if let Some((k, v)) = part.split_once('=') {
-            match k.trim().to_lowercase().as_str() {
-                "region" => region = Some(v.trim().to_string()),
-                "access_key" => access_key = Some(v.trim().to_string()),
-                "secret_key" => secret_key = Some(v.trim().to_string()),
-                "session_token" => session_token = Some(v.trim().to_string()),
-                _ => {}
-            }
-        }
-    }
-
-    let region = region.ok_or_else(|| {
-        ConnectorError::BadResponse("Bedrock connection string missing 'region='".to_string())
-    })?;
-    let access_key = access_key.ok_or_else(|| {
-        ConnectorError::BadResponse("Bedrock connection string missing 'access_key='".to_string())
-    })?;
-    let secret_key = secret_key.ok_or_else(|| {
-        ConnectorError::BadResponse("Bedrock connection string missing 'secret_key='".to_string())
-    })?;
-
-    Ok((region, access_key, secret_key, session_token))
 }
 
 // ============================================================================
