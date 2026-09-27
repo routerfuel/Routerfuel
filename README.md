@@ -35,7 +35,7 @@ RouterFuel never holds a billable key of its own. Every request is billed to *yo
 ## Quickstart (Docker)
 
 ```bash
-git clone https://github.com/uaz5/Routerfuel.git
+git clone https://github.com/routerfuel/Routerfuel.git
 cd Routerfuel
 cp env.example .env         # then fill in ROUTERFUEL_ADMIN_KEY at minimum
 ./scripts/generate-key.sh "MyFirstClient"   # copy the hash line into .env's ROUTERFUEL_API_KEYS
@@ -65,7 +65,7 @@ That builds the `app` service from the local `Dockerfile` and tags it `routerfue
 **1. Clone and build**
 
 ```
-git clone https://github.com/uaz5/Routerfuel.git
+git clone https://github.com/routerfuel/Routerfuel.git
 cd Routerfuel
 cargo build --release
 ```
@@ -123,7 +123,7 @@ cargo run --release
 
 RouterFuel is now listening on `http://localhost:3000` (or whatever `HOST`/`PORT` you set).
 
-See [USAGE.md](https://github.com/uaz5/Routerfuel/blob/main/USAGE.md) for how to actually call it, including the admin dashboard UI and Cursor setup.
+See [USAGE.md](https://github.com/routerfuel/Routerfuel/blob/main/USAGE.md) for how to actually call it, including the admin dashboard UI and Cursor setup.
 
 ## BYOK Provider Headers
 
@@ -190,4 +190,4 @@ env.example                 — copy to .env before `docker compose up`
 
 ## License
 
-This project is licensed under the GNU Affero General Public License v3.0 (AGPL-3.0) - see the [LICENSE](https://github.com/uaz5/Routerfuel/blob/main/LICENSE) file for details.
+This project is licensed under the GNU Affero General Public License v3.0 (AGPL-3.0) - see the [LICENSE](https://github.com/routerfuel/Routerfuel/blob/main/LICENSE) file for details.
