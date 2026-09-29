@@ -495,7 +495,7 @@ impl RouteEngine {
             // Anthropic Models overview: 1M context, $2/$10 per million tokens.
             // Latency and quality are RouterFuel routing estimates.
             model!(api_id: "claude-sonnet-5-5", display_name: "Claude Sonnet 5.5", provider: Provider::Anthropic,
-                cost_in: 200.0, cost_out: 1000.0, latency_ms: 170, quality: 0.95, context: 1_000_000,
+                cost_in: 200.0, cost_out: 1000.0, latency_ms: 170, quality: 0.955, context: 1_000_000,
                 vision: true, open_weight: false, enabled: true),
 
             model!(api_id: "claude-sonnet-5", display_name: "Claude Sonnet 5", provider: Provider::Anthropic,
@@ -506,11 +506,10 @@ impl RouteEngine {
                 cost_in: 100.0, cost_out: 500.0, latency_ms: 90, quality: 0.80, context: 200_000,
                 vision: true, open_weight: false, enabled: true),
 
-            // 5.1 takes over 0.99 as Anthropic's top entry and claude-fable-5
-            // steps down to 0.98 (below), so the two rank on quality outright
-            // rather than tying and falling through to registry order.
+            // A narrow within-family ordering estimate, not a cross-provider
+            // benchmark: 5.1 ranks above Fable 5 without a broad score jump.
             model!(api_id: "claude-fable-5-1", display_name: "Claude Fable 5.1", provider: Provider::Anthropic,
-                cost_in: 1000.0, cost_out: 5000.0, latency_ms: 320, quality: 0.99, context: 1_000_000,
+                cost_in: 1000.0, cost_out: 5000.0, latency_ms: 320, quality: 0.995, context: 1_000_000,
                 vision: true, open_weight: false, enabled: true),
 
             model!(api_id: "claude-fable-5", display_name: "Claude Fable 5", provider: Provider::Anthropic,
@@ -535,15 +534,10 @@ impl RouteEngine {
             // ================================================================
             // Launched 2026-09-03. Two things here are not like the others:
             //
-            // 1. `enabled: false` on purpose, not as a placeholder. Astra is
-            //    rolling out to Trusted Access Program enterprises first,
-            //    with general API access "in the coming days". Because
-            //    find() ignores `enabled` while select_*() honours it, this
-            //    gives exactly the right semantics for a limited rollout: a
-            //    client who names "gpt-6-astra" explicitly gets routed to
-            //    OpenAI, but "auto"/"task:" routing will not pick a model
-            //    most clients cannot call yet, and /v1/models (which uses
-            //    list_enabled) does not advertise it. Flip to true on GA.
+            // 1. `enabled: false` keeps Astra out of auto/task routing and
+            //    /v1/models. Explicit model IDs still resolve through find().
+            //    This is a connector-readiness gate, not an assertion about
+            //    current OpenAI API availability.
             //
             // 2. The cost figures below are OpenAI's SHORT-context rates, and
             //    `tier` now carries the long-context break that ModelConfig
@@ -570,18 +564,12 @@ impl RouteEngine {
             //    1.1M tokens that OpenAI then rejects — the failure mode the
             //    GLM-5.3 note below argues against.
             //
-            // 4. BLOCKER on flipping `enabled`, separate from GA: Astra
-            //    rejects custom `temperature` and `top_p` (OpenAI's migration
-            //    guidance is to remove both, and to omit `logprobs` on Chat
-            //    Completions). build_openai_compatible_body() in connectors.rs
-            //    forwards both whenever the client supplies them, so enabling
-            //    Astra today would 400 every request from a client that sets
-            //    a temperature — routine on an OpenAI-compatible surface.
-            //    Tool calling additionally requires the Responses API, which
-            //    RouterFuel does not speak. Enabling this needs per-model
-            //    parameter filtering built first; it is not a bool flip.
+            // 4. The direct-path reasoning filter now drops temperature/top_p
+            //    and renames max_tokens. Astra remains disabled for automatic
+            //    selection pending verified live compatibility and a safe
+            //    Responses-API tool path. Revisit that gate separately.
             model!(api_id: "gpt-6-astra", display_name: "GPT-6 Astra", provider: Provider::OpenAI,
-                cost_in: 1000.0, cost_out: 5000.0, latency_ms: 340, quality: 0.99, context: 1_050_000,
+                cost_in: 1000.0, cost_out: 5000.0, latency_ms: 340, quality: 0.999, context: 1_050_000,
                 vision: true, open_weight: false, enabled: false,
                 tier: PriceTier { above_input_tokens: 272_000, input_mult: 2.0, output_mult: 1.5 }),
 
@@ -597,7 +585,7 @@ impl RouteEngine {
             // Chat Completions supports this model, but tool calls require
             // Responses API and are rejected on RouterFuel's direct path.
             model!(api_id: "gpt-6.1-sol", display_name: "GPT-6.1 Sol", provider: Provider::OpenAI,
-                cost_in: 200.0, cost_out: 1000.0, latency_ms: 250, quality: 0.97, context: 922_000,
+                cost_in: 200.0, cost_out: 1000.0, latency_ms: 250, quality: 0.985, context: 922_000,
                 vision: true, open_weight: false, enabled: true,
                 tier: PriceTier { above_input_tokens: 272_000, input_mult: 2.0, output_mult: 1.5 }),
 
@@ -606,7 +594,7 @@ impl RouteEngine {
                 vision: true, open_weight: false, enabled: true),
 
             model!(api_id: "gpt-5.6-sol", display_name: "GPT-5.6 Sol", provider: Provider::OpenAI,
-                cost_in: 500.0, cost_out: 3000.0, latency_ms: 250, quality: 0.99, context: 1_050_000,
+                cost_in: 500.0, cost_out: 3000.0, latency_ms: 250, quality: 0.975, context: 1_050_000,
                 vision: true, open_weight: false, enabled: true),
 
             model!(api_id: "gpt-5.6-terra", display_name: "GPT-5.6 Terra", provider: Provider::OpenAI,
@@ -1708,6 +1696,19 @@ mod tests {
         assert_eq!(e.get_pricing_for("gpt-6.1-sol", 272_000).unwrap(), (200.0, 1000.0));
         assert_eq!(e.get_pricing_for("gpt-6.1-sol", 272_001).unwrap(), (400.0, 1500.0));
         assert_eq!(param_policy_for("gpt-6.1-sol"), ParamPolicy::OPENAI_REASONING);
+    }
+
+    #[test]
+    fn top_end_quality_estimates_respect_model_generations() {
+        let e = RouteEngine::new();
+        let quality = |id| e.find(id).unwrap().quality_score;
+        assert!(quality("gpt-6-astra") > quality("gpt-6.1-sol"));
+        assert!(quality("gpt-6.1-sol") > quality("gpt-6-sol"));
+        assert!(quality("gpt-6-sol") > quality("gpt-5.6-sol"));
+        assert!(quality("claude-fable-5-1") > quality("claude-fable-5"));
+        assert!(quality("claude-sonnet-5-5") > quality("claude-sonnet-5"));
+        // This calibration does not change Astra's availability policy.
+        assert!(!e.find("gpt-6-astra").unwrap().enabled);
     }
 
     #[test]
