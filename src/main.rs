@@ -281,6 +281,14 @@ fn cacheable_chat_request(request: &ChatCompletionRequest) -> bool {
 }
 
 fn validate_tool_wire(request: &ChatCompletionRequest, provider: Provider) -> Result<(), ApiError> {
+    if provider == Provider::OpenAI
+        && request.model == "gpt-6.1-sol"
+        && connectors::has_tool_payload(request)
+    {
+        return Err(ApiError::BadRequest(
+            "GPT-6.1 Sol tool calls require OpenAI's Responses API; RouterFuel's direct OpenAI connector currently uses Chat Completions".to_string(),
+        ));
+    }
     if connectors::has_tool_payload(request) && provider == Provider::Anthropic {
         connectors::validate_anthropic_tool_request(request).map_err(ApiError::BadRequest)?;
     }
@@ -1598,6 +1606,15 @@ mod request_safety_tests {
         assert!(validate_tool_wire(&request, Provider::Anthropic).is_ok());
         request.tools.as_mut().unwrap()[0]["function"]["strict"] = json!(true);
         assert!(matches!(validate_tool_wire(&request, Provider::Anthropic), Err(ApiError::BadRequest(_))));
+    }
+
+    #[test]
+    fn gpt_6_1_sol_rejects_chat_completions_tools() {
+        let mut request = request(json!([{ "role": "user", "content": "Weather in Dubai" }]));
+        request.model = "gpt-6.1-sol".into();
+        assert!(validate_tool_wire(&request, Provider::OpenAI).is_ok());
+        request.tools = Some(vec![json!({"type":"function","function":{"name":"get_weather"}})]);
+        assert!(matches!(validate_tool_wire(&request, Provider::OpenAI), Err(ApiError::BadRequest(_))));
     }
 
     #[test]
