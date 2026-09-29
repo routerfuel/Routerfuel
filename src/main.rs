@@ -281,14 +281,6 @@ fn cacheable_chat_request(request: &ChatCompletionRequest) -> bool {
 }
 
 fn validate_tool_wire(request: &ChatCompletionRequest, provider: Provider) -> Result<(), ApiError> {
-    if provider == Provider::OpenAI
-        && request.model == "gpt-6.1-sol"
-        && connectors::has_tool_payload(request)
-    {
-        return Err(ApiError::BadRequest(
-            "GPT-6.1 Sol tool calls require OpenAI's Responses API; RouterFuel's direct OpenAI connector currently uses Chat Completions".to_string(),
-        ));
-    }
     if connectors::has_tool_payload(request) && provider == Provider::Anthropic {
         connectors::validate_anthropic_tool_request(request).map_err(ApiError::BadRequest)?;
     }
@@ -311,6 +303,22 @@ fn validate_tool_wire(request: &ChatCompletionRequest, provider: Provider) -> Re
         )));
     }
     Ok(())
+}
+
+fn validate_tool_wire_for_model(
+    request: &ChatCompletionRequest,
+    provider: Provider,
+    selected_model: &str,
+) -> Result<(), ApiError> {
+    if provider == Provider::OpenAI
+        && matches!(selected_model, "gpt-6-astra" | "gpt-6.1-sol")
+        && connectors::has_tool_payload(request)
+    {
+        return Err(ApiError::BadRequest(format!(
+            "{selected_model} tool calls require OpenAI's Responses API; RouterFuel's direct OpenAI connector currently uses Chat Completions"
+        )));
+    }
+    validate_tool_wire(request, provider)
 }
 
 async fn chat_completions_handler(
@@ -432,7 +440,7 @@ async fn handle_streaming(headers: HeaderMap, state: AppState, mut request: Chat
         }
     };
 
-    if let Err(e) = validate_tool_wire(&request, byok.provider_to_call) {
+    if let Err(e) = validate_tool_wire_for_model(&request, byok.provider_to_call, &routing_model_id) {
         state.spend_guard.release(&rl_key, estimated_cost.total_cost_cents);
         return e.into_response();
     }
@@ -806,7 +814,7 @@ async fn handle_non_streaming(
             e
         })?;
 
-    if let Err(e) = validate_tool_wire(&request, byok.provider_to_call) {
+    if let Err(e) = validate_tool_wire_for_model(&request, byok.provider_to_call, &routing_model_id) {
         state.spend_guard.release(&rl_key, estimated_cost.total_cost_cents);
         return Err(e);
     }
@@ -1609,12 +1617,17 @@ mod request_safety_tests {
     }
 
     #[test]
-    fn gpt_6_1_sol_rejects_chat_completions_tools() {
+    fn responses_tool_models_reject_direct_chat_completions_tools() {
         let mut request = request(json!([{ "role": "user", "content": "Weather in Dubai" }]));
         request.model = "gpt-6.1-sol".into();
-        assert!(validate_tool_wire(&request, Provider::OpenAI).is_ok());
+        assert!(validate_tool_wire_for_model(&request, Provider::OpenAI, "gpt-6.1-sol").is_ok());
         request.tools = Some(vec![json!({"type":"function","function":{"name":"get_weather"}})]);
-        assert!(matches!(validate_tool_wire(&request, Provider::OpenAI), Err(ApiError::BadRequest(_))));
+        for id in ["gpt-6.1-sol", "gpt-6-astra"] {
+            assert!(matches!(validate_tool_wire_for_model(&request, Provider::OpenAI, id), Err(ApiError::BadRequest(_))));
+        }
+        // OpenRouter may translate tool calls itself; direct OpenAI restrictions
+        // must not be applied to that separate wire protocol.
+        assert!(validate_tool_wire_for_model(&request, Provider::OpenRouter, "gpt-6-astra").is_ok());
     }
 
     #[test]
