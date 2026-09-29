@@ -592,6 +592,15 @@ impl RouteEngine {
                 cost_in: 200.0, cost_out: 1000.0, latency_ms: 250, quality: 0.98, context: 1_050_000,
                 vision: true, open_weight: false, enabled: true),
 
+            // OpenAI's 2026-09 model catalog: $2/$10, 1.05M total context,
+            // 922K max input. Use the lower limit as the routing-safe bound.
+            // Chat Completions supports this model, but tool calls require
+            // Responses API and are rejected on RouterFuel's direct path.
+            model!(api_id: "gpt-6.1-sol", display_name: "GPT-6.1 Sol", provider: Provider::OpenAI,
+                cost_in: 200.0, cost_out: 1000.0, latency_ms: 250, quality: 0.97, context: 922_000,
+                vision: true, open_weight: false, enabled: true,
+                tier: PriceTier { above_input_tokens: 272_000, input_mult: 2.0, output_mult: 1.5 }),
+
             model!(api_id: "gpt-6-luna", display_name: "GPT-6 Luna", provider: Provider::OpenAI,
                 cost_in: 10.0, cost_out: 50.0, latency_ms: 100, quality: 0.82, context: 1_050_000,
                 vision: true, open_weight: false, enabled: true),
@@ -1474,7 +1483,7 @@ pub fn param_policy_for(api_id: &str) -> ParamPolicy {
         // is a reasoning model and the footnote is generic, but that is
         // inferred, not stated. Astra is disabled today, so this cannot
         // affect live traffic before someone verifies it with a key.
-        "gpt-6-astra" | "gpt-6-sol" | "gpt-6-luna" => ParamPolicy::OPENAI_REASONING,
+        "gpt-6-astra" | "gpt-6-sol" | "gpt-6.1-sol" | "gpt-6-luna" => ParamPolicy::OPENAI_REASONING,
 
         "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna" => ParamPolicy::OPENAI_REASONING,
         "gpt-5.5" => ParamPolicy::OPENAI_REASONING,
@@ -1686,6 +1695,19 @@ mod tests {
             assert_eq!(e.get_pricing(id).unwrap(), pricing, "{id}");
             assert_eq!(param_policy_for(id), ParamPolicy::OPENAI_REASONING, "{id}");
         }
+    }
+
+    #[test]
+    fn gpt_6_1_sol_has_published_id_limits_and_long_context_pricing() {
+        let e = RouteEngine::new();
+        let model = e.find("gpt-6.1-sol").unwrap();
+        assert_eq!(model.provider, Provider::OpenAI);
+        assert!(model.enabled && model.supports_vision);
+        assert_eq!(model.context_window, 922_000);
+        assert_eq!(e.get_pricing("gpt-6.1-sol").unwrap(), (200.0, 1000.0));
+        assert_eq!(e.get_pricing_for("gpt-6.1-sol", 272_000).unwrap(), (200.0, 1000.0));
+        assert_eq!(e.get_pricing_for("gpt-6.1-sol", 272_001).unwrap(), (400.0, 1500.0));
+        assert_eq!(param_policy_for("gpt-6.1-sol"), ParamPolicy::OPENAI_REASONING);
     }
 
     #[test]
