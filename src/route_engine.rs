@@ -63,7 +63,8 @@ pub struct ModelConfig {
     pub cost_per_1m_output: f64,
     /// Typical median latency ms (real-world, not marketing)
     pub latency_ms: u64,
-    /// Subjective 0.0–1.0 quality score used in routing math
+    /// Subjective 0.0–1.0 routing prior, not a cross-provider benchmark.
+    /// Third-decimal differences are tie-break estimates, not measured precision.
     pub quality_score: f32,
     /// Maximum input context tokens
     pub context_window: u32,
@@ -258,11 +259,9 @@ impl SelectionLimits {
 
 /// Cheap, code-tuned models preferred for `Simple` + `Code`, in order.
 ///
-/// grok-code-fast-1 stays listed first but is now a disabled registry entry
-/// (absent from xAI's model list — see build_registry), so in practice this
-/// resolves to codestral-2508. The loop below already gates on `enabled`, so
-/// leaving it here is harmless and keeps the preference order recorded for
-/// whenever xAI's catalog is re-checked.
+/// grok-code-fast-1 is listed in xAI's current model catalog as an API alias.
+/// The loop below still gates on `enabled` and BYOK reachability, so a client
+/// without an xAI key can fall through to codestral-2508.
 /// A short explicit list rather than a scored field, for the same reason
 /// `select_for_task` keeps a preferred-model fast path: these are the only
 /// registry entries with a real task specialization, and inventing a
@@ -485,7 +484,7 @@ impl RouteEngine {
                 vision: true, open_weight: false, enabled: true),
 
             model!(api_id: "claude-opus-5", display_name: "Claude Opus 5", provider: Provider::Anthropic,
-                cost_in: 500.0, cost_out: 2500.0, latency_ms: 140, quality: 0.98, context: 1_000_000,
+                cost_in: 500.0, cost_out: 2500.0, latency_ms: 140, quality: 0.982, context: 1_000_000,
                 vision: true, open_weight: false, enabled: true),
 
             model!(api_id: "claude-opus-4-8", display_name: "Claude Opus 4.8", provider: Provider::Anthropic,
@@ -499,11 +498,11 @@ impl RouteEngine {
                 vision: true, open_weight: false, enabled: true),
 
             model!(api_id: "claude-sonnet-5", display_name: "Claude Sonnet 5", provider: Provider::Anthropic,
-                cost_in: 300.0, cost_out: 1500.0, latency_ms: 170, quality: 0.94, context: 1_000_000,
+                cost_in: 300.0, cost_out: 1500.0, latency_ms: 170, quality: 0.942, context: 1_000_000,
                 vision: true, open_weight: false, enabled: true),
 
             model!(api_id: "claude-haiku-4-5", display_name: "Claude Haiku 4.5", provider: Provider::Anthropic,
-                cost_in: 100.0, cost_out: 500.0, latency_ms: 90, quality: 0.80, context: 200_000,
+                cost_in: 100.0, cost_out: 500.0, latency_ms: 90, quality: 0.803, context: 200_000,
                 vision: true, open_weight: false, enabled: true),
 
             // A narrow within-family ordering estimate, not a cross-provider
@@ -517,15 +516,15 @@ impl RouteEngine {
                 vision: true, open_weight: false, enabled: true),
 
             model!(api_id: "claude-opus-4-7", display_name: "Claude Opus 4.7", provider: Provider::Anthropic,
-                cost_in: 500.0, cost_out: 2500.0, latency_ms: 270, quality: 0.97, context: 1_000_000,
+                cost_in: 500.0, cost_out: 2500.0, latency_ms: 270, quality: 0.968, context: 1_000_000,
                 vision: true, open_weight: false, enabled: true),
 
             model!(api_id: "claude-opus-4-6", display_name: "Claude Opus 4.6", provider: Provider::Anthropic,
-                cost_in: 500.0, cost_out: 2500.0, latency_ms: 260, quality: 0.96, context: 1_000_000,
+                cost_in: 500.0, cost_out: 2500.0, latency_ms: 260, quality: 0.958, context: 1_000_000,
                 vision: true, open_weight: false, enabled: true),
 
             model!(api_id: "claude-sonnet-4-6", display_name: "Claude Sonnet 4.6", provider: Provider::Anthropic,
-                cost_in: 300.0, cost_out: 1500.0, latency_ms: 170, quality: 0.91, context: 1_000_000,
+                cost_in: 300.0, cost_out: 1500.0, latency_ms: 170, quality: 0.912, context: 1_000_000,
                 vision: true, open_weight: false, enabled: true),
 
             // ================================================================
@@ -534,10 +533,11 @@ impl RouteEngine {
             // ================================================================
             // Launched 2026-09-03. Two things here are not like the others:
             //
-            // 1. `enabled: false` keeps Astra out of auto/task routing and
-            //    /v1/models. Explicit model IDs still resolve through find().
-            //    This is a connector-readiness gate, not an assertion about
-            //    current OpenAI API availability.
+            // 1. Astra is enabled for Chat Completions requests. OpenAI's
+            //    current model page lists this endpoint and the model ID.
+            //    Chat tool requests are rejected until RouterFuel supports
+            //    its Responses-API tool path; BYOK account access is not
+            //    established by a public catalog entry.
             //
             // 2. The cost figures below are OpenAI's SHORT-context rates, and
             //    `tier` now carries the long-context break that ModelConfig
@@ -556,21 +556,15 @@ impl RouteEngine {
             //    hits per provider — so modelling them would be inventing
             //    fields no caller can populate.
             //
-            // 3. ASSUMPTION (docs-only, no authenticated request made):
-            //    context corrected 1_100_000 -> 1_050_000 to match OpenAI's
-            //    published "1,050,000 context window", which is also what the
-            //    gpt-5.6 family already carries here. The old figure would
-            //    have had select_reachable admit requests between 1.05M and
-            //    1.1M tokens that OpenAI then rejects — the failure mode the
-            //    GLM-5.3 note below argues against.
+            // 3. OpenAI publishes a 1.05M total context window but a 922K
+            //    maximum input. Routing uses the lower input bound so it
+            //    cannot select Astra for an oversized prompt.
             //
-            // 4. The direct-path reasoning filter now drops temperature/top_p
-            //    and renames max_tokens. Astra remains disabled for automatic
-            //    selection pending verified live compatibility and a safe
-            //    Responses-API tool path. Revisit that gate separately.
+            // 4. The direct-path reasoning filter drops temperature/top_p
+            //    and renames max_tokens. Live compatibility is still unverified.
             model!(api_id: "gpt-6-astra", display_name: "GPT-6 Astra", provider: Provider::OpenAI,
-                cost_in: 1000.0, cost_out: 5000.0, latency_ms: 340, quality: 0.999, context: 1_050_000,
-                vision: true, open_weight: false, enabled: false,
+                cost_in: 1000.0, cost_out: 5000.0, latency_ms: 340, quality: 0.999, context: 922_000,
+                vision: true, open_weight: false, enabled: true,
                 tier: PriceTier { above_input_tokens: 272_000, input_mult: 2.0, output_mult: 1.5 }),
 
             // OpenAI publishes 1.05M context windows, 128K max output, and
@@ -590,7 +584,7 @@ impl RouteEngine {
                 tier: PriceTier { above_input_tokens: 272_000, input_mult: 2.0, output_mult: 1.5 }),
 
             model!(api_id: "gpt-6-luna", display_name: "GPT-6 Luna", provider: Provider::OpenAI,
-                cost_in: 10.0, cost_out: 50.0, latency_ms: 100, quality: 0.82, context: 1_050_000,
+                cost_in: 10.0, cost_out: 50.0, latency_ms: 100, quality: 0.825, context: 1_050_000,
                 vision: true, open_weight: false, enabled: true),
 
             model!(api_id: "gpt-5.6-sol", display_name: "GPT-5.6 Sol", provider: Provider::OpenAI,
@@ -598,11 +592,11 @@ impl RouteEngine {
                 vision: true, open_weight: false, enabled: true),
 
             model!(api_id: "gpt-5.6-terra", display_name: "GPT-5.6 Terra", provider: Provider::OpenAI,
-                cost_in: 250.0, cost_out: 1500.0, latency_ms: 180, quality: 0.92, context: 1_050_000,
+                cost_in: 250.0, cost_out: 1500.0, latency_ms: 180, quality: 0.923, context: 1_050_000,
                 vision: true, open_weight: false, enabled: true),
 
             model!(api_id: "gpt-5.6-luna", display_name: "GPT-5.6 Luna", provider: Provider::OpenAI,
-                cost_in: 100.0, cost_out: 600.0, latency_ms: 110, quality: 0.80, context: 1_050_000,
+                cost_in: 100.0, cost_out: 600.0, latency_ms: 110, quality: 0.803, context: 1_050_000,
                 vision: true, open_weight: false, enabled: true),
 
             model!(api_id: "gpt-5.5", display_name: "GPT-5.5", provider: Provider::OpenAI,
@@ -610,11 +604,11 @@ impl RouteEngine {
                 vision: true, open_weight: false, enabled: true),
 
             model!(api_id: "gpt-5.4", display_name: "GPT-5.4", provider: Provider::OpenAI,
-                cost_in: 250.0, cost_out: 1500.0, latency_ms: 175, quality: 0.90, context: 400_000,
+                cost_in: 250.0, cost_out: 1500.0, latency_ms: 175, quality: 0.903, context: 400_000,
                 vision: true, open_weight: false, enabled: true),
 
             model!(api_id: "gpt-5.4-mini", display_name: "GPT-5.4 Mini", provider: Provider::OpenAI,
-                cost_in: 75.0, cost_out: 450.0, latency_ms: 130, quality: 0.78, context: 400_000,
+                cost_in: 75.0, cost_out: 450.0, latency_ms: 130, quality: 0.783, context: 400_000,
                 vision: true, open_weight: false, enabled: true),
 
             model!(api_id: "gpt-5.4-nano", display_name: "GPT-5.4 Nano", provider: Provider::OpenAI,
@@ -638,23 +632,23 @@ impl RouteEngine {
             // the marketing name — the suffix is an API detail, not something
             // to surface on the dashboard.
             model!(api_id: "gemini-3.1-pro-preview", display_name: "Gemini 3.1 Pro", provider: Provider::Gemini,
-                cost_in: 200.0, cost_out: 1200.0, latency_ms: 210, quality: 0.96, context: 2_000_000,
+                cost_in: 200.0, cost_out: 1200.0, latency_ms: 210, quality: 0.963, context: 2_000_000,
                 vision: true, open_weight: false, enabled: true),
 
             // The 3.6/3.7/3.8 Flash line all price identically (75/375) and
             // sit on the same 1,048,576-token window; they differ only in
-            // generation, so quality is stepped 0.88/0.89/0.90 to keep the
+            // generation, so quality is stepped in release order to keep the
             // newest preferred without disturbing anything else.
             model!(api_id: "gemini-3.8-flash", display_name: "Gemini 3.8 Flash", provider: Provider::Gemini,
-                cost_in: 75.0, cost_out: 375.0, latency_ms: 115, quality: 0.90, context: 1_048_576,
+                cost_in: 75.0, cost_out: 375.0, latency_ms: 115, quality: 0.903, context: 1_048_576,
                 vision: true, open_weight: false, enabled: true),
 
             model!(api_id: "gemini-3.7-flash", display_name: "Gemini 3.7 Flash", provider: Provider::Gemini,
-                cost_in: 75.0, cost_out: 375.0, latency_ms: 115, quality: 0.89, context: 1_048_576,
+                cost_in: 75.0, cost_out: 375.0, latency_ms: 115, quality: 0.893, context: 1_048_576,
                 vision: true, open_weight: false, enabled: true),
 
             model!(api_id: "gemini-3.6-flash", display_name: "Gemini 3.6 Flash", provider: Provider::Gemini,
-                cost_in: 75.0, cost_out: 375.0, latency_ms: 115, quality: 0.88, context: 1_048_576,
+                cost_in: 75.0, cost_out: 375.0, latency_ms: 115, quality: 0.883, context: 1_048_576,
                 vision: true, open_weight: false, enabled: true),
 
             // Corrected: this entry carried 75/450, but Google's current
@@ -663,7 +657,7 @@ impl RouteEngine {
             // 3.5 Flash as comparable to its successors while it is actually
             // twice the price.
             model!(api_id: "gemini-3.5-flash", display_name: "Gemini 3.5 Flash", provider: Provider::Gemini,
-                cost_in: 150.0, cost_out: 900.0, latency_ms: 120, quality: 0.87, context: 1_000_000,
+                cost_in: 150.0, cost_out: 900.0, latency_ms: 120, quality: 0.873, context: 1_000_000,
                 vision: true, open_weight: false, enabled: true),
 
             model!(api_id: "gemini-3.5-flash-lite", display_name: "Gemini 3.5 Flash-Lite", provider: Provider::Gemini,
@@ -688,7 +682,7 @@ impl RouteEngine {
             // "google/gemini-3-flash-preview" on its own — so that entry is
             // deleted below rather than left as a no-op.
             model!(api_id: "gemini-3-flash-preview", display_name: "Gemini 3 Flash", provider: Provider::Gemini,
-                cost_in: 50.0, cost_out: 300.0, latency_ms: 105, quality: 0.85, context: 1_000_000,
+                cost_in: 50.0, cost_out: 300.0, latency_ms: 105, quality: 0.853, context: 1_000_000,
                 vision: true, open_weight: false, enabled: true),
 
             // Corrected: this entry carried 10/40, which is 2.5 Flash-Lite's
@@ -731,16 +725,16 @@ impl RouteEngine {
             // it publishes no long-context output rate, so output remains $6.
             // Latency and quality are RouterFuel routing estimates.
             model!(api_id: "grok-4.7", display_name: "Grok 4.7", provider: Provider::XAI,
-                cost_in: 200.0, cost_out: 600.0, latency_ms: 200, quality: 0.98, context: 500_000,
+                cost_in: 200.0, cost_out: 600.0, latency_ms: 200, quality: 0.983, context: 500_000,
                 vision: true, open_weight: false, enabled: true,
                 tier: PriceTier { above_input_tokens: 200_000, input_mult: 2.0, output_mult: 1.0 }),
 
             model!(api_id: "grok-4.6", display_name: "Grok 4.6", provider: Provider::XAI,
-                cost_in: 200.0, cost_out: 600.0, latency_ms: 200, quality: 0.96, context: 500_000,
+                cost_in: 200.0, cost_out: 600.0, latency_ms: 200, quality: 0.963, context: 500_000,
                 vision: true, open_weight: false, enabled: true),
 
             model!(api_id: "grok-4.5", display_name: "Grok 4.5", provider: Provider::XAI,
-                cost_in: 200.0, cost_out: 600.0, latency_ms: 190, quality: 0.93, context: 500_000,
+                cost_in: 200.0, cost_out: 600.0, latency_ms: 190, quality: 0.933, context: 500_000,
                 vision: true, open_weight: false, enabled: true),
 
             model!(api_id: "grok-4.3", display_name: "Grok 4.3", provider: Provider::XAI,
@@ -766,26 +760,22 @@ impl RouteEngine {
                 cost_in: 20.0, cost_out: 50.0, latency_ms: 90, quality: 0.75, context: 2_000_000,
                 vision: false, open_weight: false, enabled: false),
 
-            // DISABLED for the same reason: not present in xAI's current
-            // model list. Unlike grok-4.1-fast there is no explicit
-            // retirement notice naming it, so "gone" is inferred from absence
-            // rather than stated — but SIMPLE_CODE_MODELS listed this first,
-            // meaning every Simple+Code request was being aimed at it. That
-            // path checks `enabled`, so it now falls through to codestral-2.
-            model!(api_id: "grok-code-fast-1", display_name: "Grok Code Fast 1 (unlisted)", provider: Provider::XAI,
+            // xAI's current docs list this exact API alias (grok-build-0.1).
+            // Restore it for clients with an xAI key; no paid call made here.
+            model!(api_id: "grok-code-fast-1", display_name: "Grok Code Fast 1", provider: Provider::XAI,
                 cost_in: 20.0, cost_out: 150.0, latency_ms: 100, quality: 0.78, context: 256_000,
-                vision: false, open_weight: false, enabled: false),
+                vision: false, open_weight: false, enabled: true),
 
             // ================================================================
             // DEEPSEEK — POST https://api.deepseek.com/v1/chat/completions
             // OpenAI-compatible schema — includes open-weight releases
             // ================================================================
             model!(api_id: "deepseek-v4-flash", display_name: "DeepSeek V4 Flash", provider: Provider::DeepSeek,
-                cost_in: 14.0, cost_out: 28.0, latency_ms: 140, quality: 0.85, context: 1_000_000,
+                cost_in: 14.0, cost_out: 28.0, latency_ms: 140, quality: 0.853, context: 1_000_000,
                 vision: false, open_weight: true, enabled: true),
 
             model!(api_id: "deepseek-v4-pro", display_name: "DeepSeek V4 Pro", provider: Provider::DeepSeek,
-                cost_in: 43.5, cost_out: 87.0, latency_ms: 185, quality: 0.91, context: 1_000_000,
+                cost_in: 43.5, cost_out: 87.0, latency_ms: 185, quality: 0.913, context: 1_000_000,
                 vision: false, open_weight: true, enabled: true),
 
             model!(api_id: "deepseek-v3.2", display_name: "DeepSeek V3.2 (legacy)", provider: Provider::DeepSeek,
@@ -826,11 +816,11 @@ impl RouteEngine {
             // obviously the model a 0.72 quality score was chosen for. Worth
             // a pricing pass; renaming does not settle it.
             model!(api_id: "mistral-large-2512", display_name: "Mistral Large 3", provider: Provider::Mistral,
-                cost_in: 50.0, cost_out: 150.0, latency_ms: 165, quality: 0.86, context: 128_000,
+                cost_in: 50.0, cost_out: 150.0, latency_ms: 165, quality: 0.863, context: 128_000,
                 vision: true, open_weight: false, enabled: true),
 
             model!(api_id: "mistral-small-2603", display_name: "Mistral Small 4", provider: Provider::Mistral,
-                cost_in: 10.0, cost_out: 30.0, latency_ms: 100, quality: 0.72, context: 128_000,
+                cost_in: 10.0, cost_out: 30.0, latency_ms: 100, quality: 0.723, context: 128_000,
                 vision: true, open_weight: true, enabled: true),
 
             model!(api_id: "codestral-2508", display_name: "Codestral 2508", provider: Provider::Mistral,
@@ -846,11 +836,11 @@ impl RouteEngine {
             //   compatible-mode/v1/chat/completions  (OpenAI-compatible mode)
             // ================================================================
             model!(api_id: "qwen3-max", display_name: "Qwen3 Max", provider: Provider::Qwen,
-                cost_in: 78.0, cost_out: 390.0, latency_ms: 200, quality: 0.90, context: 262_000,
+                cost_in: 78.0, cost_out: 390.0, latency_ms: 200, quality: 0.903, context: 262_000,
                 vision: true, open_weight: false, enabled: true),
 
             model!(api_id: "qwen3-235b-a22b", display_name: "Qwen3-235B-A22B", provider: Provider::Qwen,
-                cost_in: 70.0, cost_out: 280.0, latency_ms: 190, quality: 0.87, context: 262_000,
+                cost_in: 70.0, cost_out: 280.0, latency_ms: 190, quality: 0.873, context: 262_000,
                 vision: false, open_weight: true, enabled: true),
 
             model!(api_id: "qwen-turbo", display_name: "Qwen Turbo", provider: Provider::Qwen,
@@ -862,11 +852,11 @@ impl RouteEngine {
             // OpenAI-compatible schema — open-weight releases
             // ================================================================
             model!(api_id: "kimi-k3", display_name: "Kimi K3", provider: Provider::Moonshot,
-                cost_in: 300.0, cost_out: 1500.0, latency_ms: 230, quality: 0.97, context: 1_048_576,
+                cost_in: 300.0, cost_out: 1500.0, latency_ms: 230, quality: 0.973, context: 1_048_576,
                 vision: true, open_weight: true, enabled: true),
 
             model!(api_id: "kimi-k2.6", display_name: "Kimi K2.6", provider: Provider::Moonshot,
-                cost_in: 95.0, cost_out: 400.0, latency_ms: 175, quality: 0.89, context: 256_000,
+                cost_in: 95.0, cost_out: 400.0, latency_ms: 175, quality: 0.893, context: 256_000,
                 vision: true, open_weight: true, enabled: true),
 
             // DISABLED: Moonshot retired the kimi-k2.5 and moonshot-v1 series
@@ -902,22 +892,22 @@ impl RouteEngine {
             //   are open-weight but I found no weight release for 5.3. This
             //   only affects display/filtering, never routing.
             model!(api_id: "glm-5.3", display_name: "GLM-5.3", provider: Provider::Zhipu,
-                cost_in: 140.0, cost_out: 440.0, latency_ms: 200, quality: 0.92, context: 1_000_000,
+                cost_in: 140.0, cost_out: 440.0, latency_ms: 200, quality: 0.923, context: 1_000_000,
                 vision: false, open_weight: false, enabled: true),
 
             model!(api_id: "glm-5", display_name: "GLM-5", provider: Provider::Zhipu,
-                cost_in: 57.0, cost_out: 258.0, latency_ms: 180, quality: 0.86, context: 200_000,
+                cost_in: 57.0, cost_out: 258.0, latency_ms: 180, quality: 0.863, context: 200_000,
                 vision: false, open_weight: true, enabled: true),
 
             // GROQ — official production chat ids checked 2026-09-06.
             model!(api_id: "llama-3.1-8b-instant", display_name: "Llama 3.1 8B Instant (Groq)", provider: Provider::Groq,
-                cost_in: 5.0, cost_out: 8.0, latency_ms: 40, quality: 0.68, context: 131_072,
+                cost_in: 5.0, cost_out: 8.0, latency_ms: 40, quality: 0.683, context: 131_072,
                 vision: false, open_weight: true, enabled: true),
             model!(api_id: "llama-3.3-70b-versatile", display_name: "Llama 3.3 70B Versatile (Groq)", provider: Provider::Groq,
-                cost_in: 59.0, cost_out: 79.0, latency_ms: 70, quality: 0.79, context: 131_072,
+                cost_in: 59.0, cost_out: 79.0, latency_ms: 70, quality: 0.793, context: 131_072,
                 vision: false, open_weight: true, enabled: true),
             model!(api_id: "openai/gpt-oss-120b", display_name: "GPT-OSS 120B (Groq)", provider: Provider::Groq,
-                cost_in: 15.0, cost_out: 60.0, latency_ms: 55, quality: 0.82, context: 131_072,
+                cost_in: 15.0, cost_out: 60.0, latency_ms: 55, quality: 0.823, context: 131_072,
                 vision: false, open_weight: true, enabled: true),
             model!(api_id: "openai/gpt-oss-20b", display_name: "GPT-OSS 20B (Groq)", provider: Provider::Groq,
                 cost_in: 7.5, cost_out: 30.0, latency_ms: 35, quality: 0.73, context: 131_072,
@@ -931,11 +921,11 @@ impl RouteEngine {
             // These entries now route only through OpenRouter; Provider::Meta
             // and the dead api.llama.com connector have been retired.
             model!(api_id: "meta-llama/llama-4-maverick", display_name: "Llama 4 Maverick", provider: Provider::OpenRouter,
-                cost_in: 20.0, cost_out: 60.0, latency_ms: 150, quality: 0.83, context: 1_000_000,
+                cost_in: 20.0, cost_out: 60.0, latency_ms: 150, quality: 0.833, context: 1_000_000,
                 vision: true, open_weight: true, enabled: true),
 
             model!(api_id: "meta-llama/llama-4-scout", display_name: "Llama 4 Scout", provider: Provider::OpenRouter,
-                cost_in: 8.0, cost_out: 30.0, latency_ms: 120, quality: 0.75, context: 10_000_000,
+                cost_in: 8.0, cost_out: 30.0, latency_ms: 120, quality: 0.753, context: 10_000_000,
                 vision: true, open_weight: true, enabled: true),
 
             model!(api_id: "meta-llama/llama-3.3-70b-instruct", display_name: "Llama 3.3 70B (legacy)", provider: Provider::OpenRouter,
@@ -1281,8 +1271,8 @@ impl RouteEngine {
     /// Rates for a request of a given input size, applying the model's
     /// long-context tier when the input crosses its threshold.
     ///
-    /// Identical to `get_pricing` for every model with no tier, which is all
-    /// but gpt-6-astra today — so callers can use this unconditionally
+    /// Identical to `get_pricing` for every model with no tier, so callers
+    /// can use this unconditionally
     /// rather than branching on whether the selected model happens to have
     /// tiered pricing.
     ///
@@ -1707,8 +1697,20 @@ mod tests {
         assert!(quality("gpt-6-sol") > quality("gpt-5.6-sol"));
         assert!(quality("claude-fable-5-1") > quality("claude-fable-5"));
         assert!(quality("claude-sonnet-5-5") > quality("claude-sonnet-5"));
-        // This calibration does not change Astra's availability policy.
-        assert!(!e.find("gpt-6-astra").unwrap().enabled);
+        assert!(e.find("gpt-6-astra").unwrap().enabled);
+        for family in [
+            &["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash"][..],
+            &["grok-4.7", "grok-4.6", "grok-4.5"][..],
+            &["deepseek-v4-pro", "deepseek-v4-flash", "deepseek-v3.2"][..],
+            &["kimi-k3", "kimi-k2.6", "kimi-k2.5"][..],
+        ] {
+            for pair in family.windows(2) {
+                assert!(quality(pair[0]) > quality(pair[1]), "{} should outrank {}", pair[0], pair[1]);
+            }
+        }
+        for model in e.list_enabled() {
+            assert!((0.0..=1.0).contains(&model.quality_score), "{} has invalid quality", model.api_id);
+        }
     }
 
     #[test]
@@ -2006,15 +2008,16 @@ mod tests {
     }
 
     #[test]
-    fn astra_is_registered_but_not_auto_selectable() {
+    fn astra_is_registered_and_auto_selectable() {
         let e = RouteEngine::new();
 
-        // Nameable and priceable: a Trusted Access client can request it.
+        // Nameable, priceable, and advertised. Actual account access still
+        // depends on the client's BYOK key and was not tested here.
         let m = e.find("gpt-6-astra").unwrap();
         assert_eq!(m.provider, Provider::OpenAI);
-        // Corrected from 1_100_000 — OpenAI publishes 1,050,000, the same
-        // window the gpt-5.6 family already carries here.
-        assert_eq!(m.context_window, 1_050_000);
+        // OpenAI's 922K max input is the safe routing bound; 1.05M includes
+        // the model's output budget.
+        assert_eq!(m.context_window, 922_000);
         assert!(m.supports_vision);
         assert_eq!(e.get_pricing("gpt-6-astra").unwrap(), (1000.0, 5000.0));
         assert_eq!(
@@ -2022,16 +2025,8 @@ mod tests {
             Provider::OpenAI
         );
 
-        // But disabled, so it is neither advertised nor auto-selected while
-        // general API access is still rolling out.
-        assert!(!m.enabled);
-        assert!(!e.list_enabled().iter().any(|m| m.api_id == "gpt-6-astra"));
-
-        // Even a 1M-token Quality-priority request must not land on it.
-        let d = e
-            .select_reachable(900_000, 4096, RoutingPriority::Quality, None)
-            .unwrap();
-        assert_ne!(d.model.api_id, "gpt-6-astra");
+        assert!(m.enabled);
+        assert!(e.list_enabled().iter().any(|m| m.api_id == "gpt-6-astra"));
     }
 
     #[test]
@@ -2125,11 +2120,9 @@ mod tests {
     #[test]
     fn retired_and_unlisted_models_are_not_routable() {
         // kimi-k2.5 was retired 2026-08-31 (404s); grok-4.1-fast's family
-        // was retired 2026-05-15; grok-code-fast-1 is absent from xAI's
-        // current list. All three were `enabled: true`, so auto/task routing
-        // could pick a model that cannot answer.
+        // was retired 2026-05-15. Keep both for historical pricing only.
         let e = RouteEngine::new();
-        for id in ["kimi-k2.5", "grok-4.1-fast", "grok-code-fast-1"] {
+        for id in ["kimi-k2.5", "grok-4.1-fast"] {
             // Still findable, so historical request_logs rows resolve for
             // pricing and display.
             assert!(e.find(id).is_ok(), "{id} should remain in the registry");
@@ -2142,14 +2135,12 @@ mod tests {
     }
 
     #[test]
-    fn simple_code_survives_grok_code_fast_1_being_disabled() {
-        // SIMPLE_CODE_MODELS still lists grok-code-fast-1 first; the loop
-        // gates on `enabled`, so this must fall through to codestral-2508
-        // rather than returning a dead model or erroring.
+    fn simple_code_uses_current_xai_alias_when_reachable() {
         let e = RouteEngine::new();
         let shape = RequestShape { task: TaskKind::Code, difficulty: Difficulty::Simple };
         let d = e.select_for_shape(shape, 300, 256, None).unwrap();
-        assert_eq!(d.model.api_id, "codestral-2508");
+        assert_eq!(d.model.api_id, "grok-code-fast-1");
+        assert!(e.find("grok-code-fast-1").unwrap().enabled);
     }
 
     #[test]
