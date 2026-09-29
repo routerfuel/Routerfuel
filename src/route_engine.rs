@@ -492,6 +492,12 @@ impl RouteEngine {
                 cost_in: 500.0, cost_out: 2500.0, latency_ms: 260, quality: 0.93, context: 1_000_000,
                 vision: true, open_weight: false, enabled: true),
 
+            // Anthropic Models overview: 1M context, $2/$10 per million tokens.
+            // Latency and quality are RouterFuel routing estimates.
+            model!(api_id: "claude-sonnet-5-5", display_name: "Claude Sonnet 5.5", provider: Provider::Anthropic,
+                cost_in: 200.0, cost_out: 1000.0, latency_ms: 170, quality: 0.95, context: 1_000_000,
+                vision: true, open_weight: false, enabled: true),
+
             model!(api_id: "claude-sonnet-5", display_name: "Claude Sonnet 5", provider: Provider::Anthropic,
                 cost_in: 300.0, cost_out: 1500.0, latency_ms: 170, quality: 0.94, context: 1_000_000,
                 vision: true, open_weight: false, enabled: true),
