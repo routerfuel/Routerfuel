@@ -27,3 +27,7 @@ Follow-up: live-verify Vertex tool calls with a real project, region, enabled Ve
 ## Anthropic strict tools
 
 OpenAI `function.strict` now maps to Anthropic tool-level `strict` in streaming and non-streaming bodies. Preserve input schemas exactly; do not silently remove constraints. Malformed booleans and misplaced tool-level strict in OpenAI-shaped input are rejected. Official documentation and mock HTTP tool cycles verify the mapping; live-provider verification remains pending.
+
+## Shadow admission
+
+Shadow requests default to 15% probabilistic sampling (`SHADOW_SAMPLE_PERCENT`, 0?100; invalid values disable sampling). Only successful non-streaming requests that specify `shadow_model` are eligible. Sample before reserving spend, and admit only a strictly cheaper estimated call using known tier-aware prices and a common output-token estimate. Tool formats must validate before calling. Actual output costs can differ; output length is not a quality evaluation.

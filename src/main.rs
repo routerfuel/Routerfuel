@@ -28,6 +28,7 @@ mod vision;
 mod vertex;
 mod responses;
 mod responses_stream;
+mod shadow_policy;
 
 use axum::{
     extract::{DefaultBodyLimit, State},
@@ -979,7 +980,7 @@ async fn handle_non_streaming(
                 provider_keys.clone(),
                 shadow_model_id,
                 &effective_request,
-                response.model.clone(),
+                routing_model_id.clone(),
                 byok.provider_to_call,
                 token_cost.total_cost_cents,
                 latency_ms,
@@ -1071,12 +1072,20 @@ fn maybe_fire_shadow_request(
     primary_latency_ms: u64,
     primary_output_chars: usize,
 ) {
+    let configured_rate = std::env::var("SHADOW_SAMPLE_PERCENT").ok();
+    let percent = shadow_policy::sample_percent(configured_rate.as_deref());
+    let utc_day = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    if !shadow_policy::sampled(&request_id, client_id.as_deref().unwrap_or("anonymous"), &utc_day, percent) {
+        debug!(sample_percent = percent, "Shadow request not sampled");
+        return;
+    }
     let route_engine = Arc::clone(&state.route_engine);
     let connector_manager = Arc::clone(&state.connector_manager);
     let cost_tracker = Arc::clone(&state.cost_tracker);
     let spend_guard = Arc::clone(&state.spend_guard);
     let concurrency_limiter = Arc::clone(&state.concurrency_limiter);
 
+    let effective_request_for_estimate = effective_request.clone();
     let mut shadow_request = effective_request.clone();
     let spend_key = client_id.clone().unwrap_or_else(|| "anonymous".to_string());
 
@@ -1144,21 +1153,41 @@ fn maybe_fire_shadow_request(
         // outgoing shadow_request (same messages as the primary call, since
         // shadow mode sends an identical prompt), then price it with the
         // shadow model's own rates. No char-count guessing.
-        let shadow_input_tokens = tokens::count_completion_request_tokens(&shadow_request)
-            .unwrap_or(0);
+        let shadow_input_tokens = match tokens::count_completion_request_tokens(&shadow_request) {
+            Ok(count) => count,
+            Err(_) => { debug!("Shadow token estimate unavailable, skipping"); return; }
+        };
         let shadow_estimated_output = tokens::estimate_output_tokens(shadow_request.max_tokens, &shadow_request.model);
         // get_pricing_for: the shadow call is fully billed and reserved
         // against the client's cap like any other, so a shadow at a
         // tiered-pricing model must reserve at its tiered rate too.
-        let (shadow_cost_in, shadow_cost_out) = route_engine
-            .get_pricing_for(&shadow_model_id, shadow_input_tokens)
-            .unwrap_or((500.0, 3000.0));
+        let Ok((shadow_cost_in, shadow_cost_out)) = route_engine
+            .get_pricing_for(&shadow_model_id, shadow_input_tokens) else {
+                debug!("Shadow pricing unavailable, skipping"); return;
+            };
+        let Ok(primary_input_tokens) = tokens::count_completion_request_tokens(&effective_request_for_estimate) else { return; };
+        let Ok((primary_cost_in, primary_cost_out)) = route_engine.get_pricing_for(&primary_model, primary_input_tokens) else {
+            debug!("Primary pricing unavailable, skipping shadow"); return;
+        };
+        let primary_estimated_cost = TokenCostBreakdown::new(
+            primary_input_tokens,
+            shadow_estimated_output,
+            primary_cost_in, primary_cost_out,
+        ).total_cost_cents;
         let shadow_estimated_cost_cents = TokenCostBreakdown::new(
             shadow_input_tokens,
             shadow_estimated_output,
             shadow_cost_in,
             shadow_cost_out,
         ).total_cost_cents;
+
+        if !shadow_policy::cheaper(primary_estimated_cost, shadow_estimated_cost_cents) {
+            debug!(primary_estimated_cost, shadow_estimated_cost_cents, "Shadow model is not cheaper, skipping");
+            return;
+        }
+        if validate_tool_wire_for_model(&shadow_request, byok_shadow.provider_to_call, &shadow_model_id).is_err() {
+            debug!("Shadow model cannot handle this tool request, skipping"); return;
+        }
 
         // Step 4: reserve against the SHADOW model's real estimate, not the
         // primary's cost.

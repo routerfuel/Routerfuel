@@ -27,3 +27,10 @@ None of the unchecked items above should be described as available APIs.
 
 - Streaming Responses adapter forwards text deltas and emits complete tool calls with replay metadata at the terminal event. Fragmented SSE framing is tested across every byte boundary. Interrupted Responses streams report an error and retain the estimated spend reservation when final usage is unavailable. Live verification remains pending.
 - First voice integration selected by user: LiveKit with OpenAI speech APIs.
+
+## Shadow cost optimization
+
+- [x] Sample approximately 15% of eligible successful non-streaming requests that specify `shadow_model`; configurable with `SHADOW_SAMPLE_PERCENT`.
+- [x] Admit only strictly cheaper estimated shadow calls, using tier-aware pricing and a common output-token estimate; skip unknown pricing and incompatible tool requests.
+- [ ] End-of-day evaluated shadow quality report (matched/worse/better) and savings.
+- [ ] Narrow JSON-schema prompt adaptation for cheaper models.

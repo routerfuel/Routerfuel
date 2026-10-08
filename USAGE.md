@@ -129,14 +129,18 @@ Add a `shadow_model` field to compare a second model against the primary one, wi
 ```json
 {
   "model": "claude-sonnet-5",
-  "shadow_model": "gpt-5.6-sol",
+  "shadow_model": "gpt-6-luna",
   "messages": [{ "role": "user", "content": "Hello" }]
 }
 ```
 
 The comparison (cost delta, latency delta, output length) lands in the `shadow_comparisons` table and is queryable via `GET /admin/shadow`.
 
-**Shadow mode is ON by default.** Any client that sends `shadow_model` triggers a second, fully-billed call — there's no server-side opt-in required. This also means it's a second real charge to whatever BYOK key the client supplied for the shadow provider. Set `ENABLE_SHADOW_MODE=false` on the server if you don't want clients able to trigger this at all.
+**Shadow mode is ON by default, with 15% sampling.** Sending `shadow_model` makes a successful non-streaming request eligible for comparison; it does not guarantee another provider call. `SHADOW_SAMPLE_PERCENT=15` samples approximately 15% using a stable hash of the server-generated request ID, client identity, and UTC date. This is probabilistic, not an exact daily quota. Set 0 to disable sampling or 100 to sample every eligible request; invalid values disable sampling. `ENABLE_SHADOW_MODE=false` disables the feature entirely.
+
+A shadow runs only when its estimated cost is strictly lower than the primary's, using the same estimated output-token count and tier-aware input pricing. Missing prices or token estimates skip the call. Actual generated lengths can differ, so this is not a guarantee about the final bill. The shadow requires a compatible tool format and available BYOK credentials, and retains its own spend reservation and concurrency limit. Existing streaming and cache-hit requests do not generate shadows. Unsampled and non-cheaper requests are skipped before any shadow spend is reserved.
+
+Shadow statistics currently compare cost, latency, errors, and output length. They do not establish whether an answer matched, did better, or did worse in quality; outcome evaluation and end-of-day quality reports remain future work.
 
 ## 4. Other endpoints
 
