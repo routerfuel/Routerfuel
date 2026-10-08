@@ -26,6 +26,8 @@ mod telemetry;
 mod tokens;
 mod vision;
 mod vertex;
+mod responses;
+mod responses_stream;
 
 use axum::{
     extract::{DefaultBodyLimit, State},
@@ -314,9 +316,10 @@ fn validate_tool_wire_for_model(
         && matches!(selected_model, "gpt-6-astra" | "gpt-6.1-sol")
         && connectors::has_tool_payload(request)
     {
-        return Err(ApiError::BadRequest(format!(
-            "{selected_model} tool calls require OpenAI's Responses API; RouterFuel's direct OpenAI connector currently uses Chat Completions"
-        )));
+        let mut resolved = request.clone();
+        resolved.model = selected_model.to_owned();
+        resolved.stream = None;
+        responses::build_body(&resolved).map_err(|e| ApiError::BadRequest(e.to_string()))?;
     }
     validate_tool_wire(request, provider)
 }
@@ -1613,17 +1616,22 @@ mod request_safety_tests {
         request.stream = Some(true);
         assert!(validate_tool_wire(&request, Provider::Anthropic).is_ok());
         request.tools.as_mut().unwrap()[0]["function"]["strict"] = json!(true);
-        assert!(matches!(validate_tool_wire(&request, Provider::Anthropic), Err(ApiError::BadRequest(_))));
+        assert!(validate_tool_wire(&request, Provider::Anthropic).is_ok());
+        request.stream = None;
+        assert!(validate_tool_wire(&request, Provider::Anthropic).is_ok());
     }
 
     #[test]
-    fn responses_tool_models_reject_direct_chat_completions_tools() {
+    fn responses_tool_models_accept_supported_function_turns() {
         let mut request = request(json!([{ "role": "user", "content": "Weather in Dubai" }]));
         request.model = "gpt-6.1-sol".into();
         assert!(validate_tool_wire_for_model(&request, Provider::OpenAI, "gpt-6.1-sol").is_ok());
         request.tools = Some(vec![json!({"type":"function","function":{"name":"get_weather"}})]);
         for id in ["gpt-6.1-sol", "gpt-6-astra"] {
-            assert!(matches!(validate_tool_wire_for_model(&request, Provider::OpenAI, id), Err(ApiError::BadRequest(_))));
+            assert!(validate_tool_wire_for_model(&request, Provider::OpenAI, id).is_ok());
+            request.stream = Some(true);
+            assert!(validate_tool_wire_for_model(&request, Provider::OpenAI, id).is_ok());
+            request.stream = None;
         }
         // OpenRouter may translate tool calls itself; direct OpenAI restrictions
         // must not be applied to that separate wire protocol.

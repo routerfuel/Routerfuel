@@ -305,6 +305,11 @@ impl Connector for GenericOpenAICompatibleConnector {
         req: &ChatCompletionRequest,
         client_api_key: &str,
     ) -> Result<ConnectorResult, ConnectorError> {
+        if self.provider == Provider::OpenAI && crate::responses::required(req) {
+            let endpoint = self.base_url.strip_suffix("/chat/completions")
+                .ok_or_else(|| ConnectorError::NotImplemented("Responses endpoint is not configured".into()))?;
+            return crate::responses::complete(&self.client, &format!("{endpoint}/responses"), client_api_key, req, &self.circuit_breaker).await;
+        }
         openai_compatible_call(
             &self.client,
             &self.base_url,
@@ -374,17 +379,14 @@ fn anthropic_tool_request(req: &ChatCompletionRequest) -> Result<AnthropicReq, C
     let bad = |message: &str| ConnectorError::BadResponse(message.to_string());
     let mut tools = Vec::new();
     for tool in req.tools.as_deref().unwrap_or(&[]) {
-        if tool.get("strict") == Some(&Value::Bool(true)) {
-            return Err(bad("Strict-mode tool schemas aren't supported through the Anthropic connector yet"));
+        if tool.get("strict").is_some() {
+            return Err(bad("OpenAI-shaped tools must place strict inside function, not on the tool"));
         }
         if tool.get("type").and_then(Value::as_str) != Some("function") {
             return Err(bad("Anthropic connector supports only function tools"));
         }
         let function = tool.get("function").ok_or_else(|| bad("Function tool is missing function"))?;
-        if function.get("strict") == Some(&Value::Bool(true)) {
-            return Err(bad("Strict-mode tool schemas aren't supported through the Anthropic connector yet"));
-        }
-        if function.get("strict").is_some() && function.get("strict") != Some(&Value::Bool(false)) {
+        if function.get("strict").is_some_and(|value| !value.is_boolean()) {
             return Err(bad("Function strict must be a boolean"));
         }
         let name = function.get("name").and_then(Value::as_str).filter(|s| !s.is_empty())
@@ -395,6 +397,9 @@ fn anthropic_tool_request(req: &ChatCompletionRequest) -> Result<AnthropicReq, C
             return Err(bad("Function parameters must be a JSON object"));
         }
         let mut mapped = json!({"name":name,"input_schema":schema});
+        // Anthropic strict belongs on the tool, not inside input_schema.
+        // Preserve the schema exactly; unsupported schemas are rejected upstream.
+        if let Some(strict) = function.get("strict") { mapped["strict"] = strict.clone(); }
         if let Some(description) = function.get("description") {
             if !description.is_string() { return Err(bad("Function description must be a string")); }
             mapped["description"] = description.clone();
@@ -1645,11 +1650,22 @@ mod tests {
     }
 
     #[test]
-    fn anthro_rejects_strict_tool_schema_without_dropping_it() {
+    fn anthro_preserves_strict_and_schema_without_silent_rewrites() {
         let mut request = anthro_req();
+        let schema = serde_json::json!({"type":"object","properties":{"slot":{"type":"string"}},"required":["slot"],"additionalProperties":false});
+        request.tools.as_mut().unwrap()[0]["function"]["parameters"] = schema.clone();
+        for strict in [true, false] {
+            request.tools.as_mut().unwrap()[0]["function"]["strict"] = serde_json::json!(strict);
+            let body = serde_json::to_value(anthropic_tool_request(&request).unwrap()).unwrap();
+            assert_eq!(body["tools"][0]["strict"], strict);
+            assert_eq!(body["tools"][0]["input_schema"], schema);
+            assert_eq!(anthropic_stream_body(&request).unwrap()["tools"][0]["strict"], strict);
+        }
+        request.tools.as_mut().unwrap()[0]["function"]["strict"] = serde_json::json!("true");
+        assert!(validate_anthropic_tool_request(&request).unwrap_err().contains("boolean"));
         request.tools.as_mut().unwrap()[0]["function"]["strict"] = serde_json::json!(true);
-        let error = validate_anthropic_tool_request(&request).unwrap_err();
-        assert!(error.contains("Strict-mode tool schemas aren't supported"));
+        request.tools.as_mut().unwrap()[0]["strict"] = serde_json::json!(false);
+        assert!(validate_anthropic_tool_request(&request).is_err());
     }
 
     #[test]
@@ -1699,6 +1715,8 @@ mod tests {
         connector.url = format!("http://{address}/v1/messages");
 
         let mut request = anthro_req();
+        request.tools.as_mut().unwrap()[0]["function"]["strict"] = serde_json::json!(true);
+        request.tools.as_mut().unwrap()[0]["function"]["parameters"] = serde_json::json!({"type":"object","properties":{"slot":{"type":"string"}},"required":["slot"],"additionalProperties":false});
         let first = connector.complete(&request, "local-test-key").await.unwrap();
         assert_eq!(first.response.choices[0].finish_reason, "tool_calls");
         let call = first.response.choices[0].message.tool_calls.as_ref().unwrap()[0].clone();
@@ -1711,6 +1729,10 @@ mod tests {
         assert_eq!(second.response.choices[0].message.content.as_text(), "Booked.");
         let captures = seen.lock();
         assert_eq!(captures[0]["tools"][0]["name"], "book");
+        for body in captures.iter() {
+            assert_eq!(body["tools"][0]["strict"], true);
+            assert_eq!(body["tools"][0]["input_schema"]["required"], serde_json::json!(["slot"]));
+        }
         assert_eq!(captures[1]["messages"][1]["content"][1]["type"], "tool_use");
         assert_eq!(captures[1]["messages"][2]["content"][0]["tool_use_id"], "call_1");
     }

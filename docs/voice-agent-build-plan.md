@@ -24,7 +24,7 @@ The deployment must remain self hosted and BYOK. Every billable provider request
 
 ### 1. Tool correctness
 
-Follow-up (separate PR): verify and implement Anthropic's equivalent of OpenAI `strict: true` tool schemas. Anthropic translation must reject `strict: true` explicitly until then. OpenAI-shaped streaming SSE translation has mock-provider coverage but still requires an authorized live Anthropic round trip before claiming provider-verified support.
+Anthropic strict tool mapping is documentation-verified and mock-tested: OpenAI `function.strict` becomes Anthropic tool-level `strict`, with the original input schema preserved. Malformed or misplaced strict fields are rejected. Supported models and schema acceptance are enforced by Anthropic; no schema simplification occurs in RouterFuel. Live strict-mode verification remains pending. OpenAI-shaped streaming SSE translation has mock-provider coverage but still requires an authorized live Anthropic round trip before claiming provider-verified support.
 
 - Preserve OpenAI tool definitions, assistant tool calls, tool results, and null assistant content for OpenAI-compatible providers. Preserve streaming tool-call deltas byte for byte.
 - Translate tools for Anthropic, Gemini, and Vertex only with provider-specific round-trip tests. Until then reject unsupported combinations before calling a provider.

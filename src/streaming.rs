@@ -146,7 +146,14 @@ pub async fn stream_handler(
             // FIX: reconcile the reservation main.rs made before this
             // stream started against the real cost now known — this is the
             // only place a streaming request's spend ever gets recorded.
-            spend_guard_clone.reconcile(&rl_key_clone, estimated_cost_cents, token_cost.total_cost_cents);
+            if payload.usage_known {
+                spend_guard_clone.reconcile(&rl_key_clone, estimated_cost_cents, token_cost.total_cost_cents);
+            } else {
+                // Keep the conservative reservation until its window expires.
+                // Missing upstream usage is not evidence of a free request.
+                error!("Responses usage missing; retaining estimated spend reservation");
+                return;
+            }
 
             cost_tracker_clone.record_request(
                 request_id_clone,
@@ -192,6 +199,11 @@ pub async fn stream_handler(
     } else { None };
 
     let (url, body): (String, serde_json::Value) = match provider {
+        Provider::OpenAI if crate::responses::required(&req) => {
+            let mut resolved = req.clone(); resolved.stream = None;
+            let mut body = crate::responses::build_body(&resolved)?; body["stream"] = serde_json::json!(true);
+            ("https://api.openai.com/v1/responses".to_string(), body)
+        }
         Provider::Anthropic => {
             let body = crate::connectors::anthropic_stream_body(&req)?;
             (provider_base_url(Provider::Anthropic).to_string(), body)
@@ -261,6 +273,7 @@ pub async fn stream_handler(
         }
     };
 
+    let is_responses = provider == Provider::OpenAI && crate::responses::required(&req);
     let is_gemini = matches!(provider, Provider::Gemini);
     let is_anthropic = matches!(provider, Provider::Anthropic);
     let is_azure = matches!(provider, Provider::AzureOpenAI);
@@ -355,6 +368,9 @@ pub async fn stream_handler(
         let mut anthropic_framer = crate::anthropic_stream::SseFramer::default();
         let mut anthropic_translator = crate::anthropic_stream::Translator::default();
 
+        let mut responses_framer = crate::anthropic_stream::SseFramer::default();
+        let mut responses_translator = crate::responses_stream::Translator::default();
+
         while let Some(chunk) = byte_stream.next().await {
             let bytes = match chunk {
                 Ok(b) => b,
@@ -364,6 +380,27 @@ pub async fn stream_handler(
                 }
             };
 
+            if is_responses {
+                let frames = match responses_framer.push(&bytes) {
+                    Ok(frames) => frames,
+                    Err(_) => { yield Event::default().data(serde_json::json!({"error":"Invalid Responses SSE frame"}).to_string()); break; }
+                };
+                let mut failed = false;
+                for frame in frames {
+                    match responses_translator.translate(&frame) {
+                        Ok((chunks, done)) => {
+                            input_tokens = responses_translator.input_tokens; output_tokens = responses_translator.output_tokens;
+                            for chunk in chunks { yield Event::default().data(chunk.to_string()); }
+                            if done {
+                                let _ = audit_tx.send(AuditPayload { provider, input_tokens, output_tokens, usage_known: true, total_latency_ms:start.elapsed().as_millis() as u64, ttfb_ms }).await;
+                                yield Event::default().data("[DONE]"); return;
+                            }
+                        }
+                        Err(_) => { yield Event::default().data(serde_json::json!({"error":"Responses stream translation failed"}).to_string()); failed=true; break; }
+                    }
+                }
+                if failed { break; } continue;
+            }
             if is_anthropic {
                 let frames = match anthropic_framer.push(&bytes) {
                     Ok(frames) => frames,
@@ -391,7 +428,7 @@ pub async fn stream_handler(
                     }
                     if translated.done {
                         let _ = audit_tx.send(AuditPayload {
-                            provider, input_tokens, output_tokens,
+                            provider, input_tokens, output_tokens, usage_known: true,
                             total_latency_ms: start.elapsed().as_millis() as u64, ttfb_ms,
                         }).await;
                         yield Event::default().data("[DONE]");
@@ -419,7 +456,7 @@ pub async fn stream_handler(
                 if data == "[DONE]" {
                     debug!(chunks = chunk_count, chars = full_text.len(), "Stream complete");
                     let _ = audit_tx.send(AuditPayload {
-                        provider, input_tokens, output_tokens,
+                        provider, input_tokens, output_tokens, usage_known: true,
                         total_latency_ms: start.elapsed().as_millis() as u64,
                         ttfb_ms,
                     }).await;
@@ -492,10 +529,11 @@ pub async fn stream_handler(
         // cost instead of the audit task's release-on-drop path treating a
         // partially-successful stream as a total failure.
         let _ = audit_tx.send(AuditPayload {
-            provider, input_tokens, output_tokens,
+            provider, input_tokens, output_tokens, usage_known: !is_responses,
             total_latency_ms: start.elapsed().as_millis() as u64,
             ttfb_ms,
         }).await;
+        if is_responses { yield Event::default().data(serde_json::json!({"error":"Responses stream ended before terminal response; usage may be unknown"}).to_string()); }
         if is_anthropic {
             let message = if anthropic_framer.is_empty() { "Anthropic stream ended without message_stop" }
                 else { "Anthropic stream ended with an incomplete SSE frame" };
@@ -512,6 +550,7 @@ pub async fn stream_handler(
 
 #[derive(Debug)]
 struct AuditPayload {
+    usage_known: bool,
     provider: Provider,
     input_tokens: u32,
     output_tokens: u32,
