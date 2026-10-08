@@ -2,29 +2,44 @@
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPLv3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 
-A BYOK (Bring Your Own Key) AI gateway written in Rust. RouterFuel sits between your app and the LLM providers you already have keys for — Anthropic, OpenAI, Gemini, DeepSeek, xAI, Mistral, Qwen, Moonshot, Zhipu, Azure OpenAI, AWS Bedrock, Groq, and OpenRouter as a universal fallback — and adds the routing, cost tracking, caching, and safety nets you'd otherwise have to build yourself.
+A BYOK (Bring Your Own Key) AI gateway written in Rust. RouterFuel sits between your app and the LLM providers you already have keys for — Anthropic, OpenAI, Gemini, DeepSeek, xAI, Mistral, Qwen, Moonshot, Zhipu, Azure OpenAI, AWS Bedrock, Vertex AI, Groq, and OpenRouter as a universal fallback — and adds the routing, cost tracking, caching, and safety nets you'd otherwise have to build yourself.
 
 RouterFuel never holds a billable key of its own. Every request is billed to *your* provider account, using *your* key. RouterFuel's job is just to route it well, cache it when it can, and tell you what it cost.
 
 ## Features
 
-- **Smart routing** — pick a model by name, let RouterFuel auto-select on cost/latency/quality, or route by task type (`task:summarize`, `task:extract_action_items`, `task:draft_response`, `task:answer_question`, `task:classify`)
-- **BYOK across 13 providers** — supply your own key per provider via request headers; OpenRouter acts as a universal fallback if that's the only key you have
+- **Smart routing** — pick a model by name, let RouterFuel auto-select using cost and configured latency/quality estimates, or route by task type (`task:summarize`, `task:extract_action_items`, `task:draft_response`, `task:answer_question`, `task:classify`)
+- **BYOK across 14 provider routes** — supply your own key per provider via request headers; OpenRouter acts as a universal fallback if that's the only key you have
 - **Azure OpenAI** — bring your own Azure OpenAI deployment; supply an endpoint + API key (or managed identity) via the `X-Azure-OpenAI-Connection` header. Models are fetched dynamically from your Azure Foundry deployments list at startup
 - **AWS Bedrock** — bring your own AWS Bedrock access; supply region + IAM credentials via the `X-Bedrock-Connection` header. Non-streaming requests use the Converse API with SigV4 signing. This path has mock coverage but awaits live AWS verification; the catalog fetcher is not wired into startup.
 - **Vision support** — send images (URL or base64) to any vision-capable model in the registry
 - **Semantic caching** — a local ONNX embedding model (no external API cost) matches semantically similar prompts and serves cached responses instead of re-calling a provider. Cache entries are scoped per client and currently apply only to single plain-text user turns with default generation parameters; conversation histories and tool requests bypass the cache.
+- **OpenAI Responses tool adapter** - direct GPT-6.1 Sol and GPT-6 Astra plain-text function turns use OpenAI's Responses API upstream, while clients keep calling `/v1/chat/completions`. Non-streaming and SSE translation have mock coverage. Streaming text is forwarded incrementally; complete function calls are emitted at the terminal response. Clients must replay the full returned assistant tool-call object, including `routerfuel_response_items` on the first call, to preserve encrypted reasoning state. Multimodal tool turns and unmappable inputs are rejected. Live OpenAI verification remains pending.
+- **Anthropic strict tools** - OpenAI-shaped `function.strict` maps to Anthropic tool-level `strict` on non-streaming and streaming requests. Schemas are preserved unchanged; malformed flags are rejected. Anthropic enforces supported schemas and model availability. Documentation and mock tool-cycle verification are complete; live-provider verification remains pending. See [verification notes](docs/anthropic-strict-verification.md).
 - **Tool calls** — supported through OpenAI-compatible connectors and the Anthropic connector on `/v1/chat/completions`, including Anthropic streaming SSE translation; Anthropic's native `/v1/messages` also supports its own tool format. Gemini and Vertex support ordinary function tools on the non-streaming OpenAI-shaped endpoint; streaming, strict-mode schemas, and ambiguous repeated same-name calls are rejected for those two connectors. Vertex tool-call translation is tested with mocks only, not yet live-verified against Vertex. Follow-up: live-verify Vertex tool calls before claiming provider-verified support. Bedrock supports non-streaming tool translation for Claude 3 and Nova model IDs only, with mock coverage but no live AWS verification; Bedrock streaming tools, strict mode, and unverified model families are rejected. Voice transport, MCP governance, and a conversation ledger are not shipped.
 - **Cost tracking & audit trail** — every request is logged with token counts, cost, latency, and savings vs. a GPT-4o baseline
 - **Circuit breaker** — automatically stops sending traffic to a provider that's returning errors, and probes it back into rotation once it recovers
 - **Rate limiting & tiers** — per-key rate limits (free / pro / enterprise), configurable via env var or the `client_tiers` Postgres table; database changes are reloaded on a timer (default 30 seconds)
 - **Stable organization identity** — a database-provisioned `organization_id` can group multiple client keys so request logs stay associated with one tenant across key rotation; existing and env-only keys retain their individual key hash as the default identity
 - **Concurrency limiting** — bounds in-flight provider calls so a traffic spike doesn't get you rate-limited or IP-blocked upstream
-- **Guardrails** — LoopGuard flags a client stuck retrying the same prompt; SpendGuard hard-caps per-client spend in a rolling window
-- **Shadow-mode A/B testing** ? clients request a comparison with `shadow_model`; the gateway samples 15% of eligible successful non-streaming requests by default. Only a strictly cheaper estimated shadow call is admitted, with its own spend reservation. Each executed shadow call bills the customer's BYOK account. Sampling does not run on streaming or cache-hit requests.
+- **Guardrails** — LoopGuard flags a client stuck retrying the same prompt; SpendGuard reserves estimated spend and reconciles known usage against a per-key rolling-window cap. These controls are process-local; multiple replicas do not share one global cap
+- **Shadow-mode A/B testing** - clients request a comparison with `shadow_model`; the gateway samples 15% of eligible successful non-streaming requests by default. Only a strictly cheaper estimated shadow call is admitted, with its own spend reservation. Each executed shadow call bills the customer's BYOK account. Sampling does not run on streaming or cache-hit requests.
 - **Streaming** — SSE streaming for Anthropic, Gemini, Azure OpenAI, and OpenAI-compatible providers. Bedrock's legacy streaming path has not been migrated to Converse/SigV4 and is not verified against AWS; do not rely on it.
 - **Admin dashboard** — a self-hosted, no-build-step web UI at `/admin/dashboard` visualizing spend, cache performance, per-model and per-client cost, the request timeline, rate-limit tiers, and shadow-mode comparisons — reads the `/admin/*` endpoints below in real time. The dashboard *page* itself is public; the data endpoints it calls each require `X-Admin-Key`
+- **Prompt compression audit** - measure whitespace normalization and duplicate-message savings without changing the prompt by default. Enable Tier 1 transformations with `ROUTERFUEL_SUPERCOMPRESS_MODE=on`; no extra LLM call is made.
 - **Cursor integration** — point Cursor's custom OpenAI-compatible model settings straight at RouterFuel and route your editor's requests through your own provider keys
+
+## Current status and limits
+
+The Rust unit and mock-provider suite passed all 189 tests after the Responses, Anthropic strict-tool, and shadow-sampling changes. Mock tests verify gateway behavior; they do not establish live provider compatibility or model quality.
+
+- Shadow mode samples approximately 15% of eligible successful non-streaming requests that specify `shadow_model`. This is probabilistic, not an exact daily quota. Unknown prices, failed token estimates, non-cheaper candidates, and incompatible tool formats skip the call before spend reservation. Actual output lengths can differ, so a cheaper estimate does not guarantee a cheaper final bill.
+- `/admin/shadow` compares cost, latency, output length, and errors. It does not evaluate whether an answer matched, improved, or degraded quality. End-of-day quality evaluation and JSON-schema prompt adaptation remain planned.
+- Routing quality and latency values are configured estimates, not learned production outcomes. Circuit breakers are implemented; automatic retry/fallback to a second model and deployment-pool failover remain planned.
+- Live Bedrock and Vertex tool verification is pending. Streaming tool translation for Gemini, Vertex, and Bedrock remains unsupported.
+- LiveKit with OpenAI speech APIs is the selected first voice integration; voice transport, MCP permissions, conversation/outcome accounting, and outcome-based optimization are not shipped.
+
+See [the current task list](docs/TODO.md) and [voice-agent build plan](docs/voice-agent-build-plan.md) for remaining work and release gates.
 
 ## Requirements
 
@@ -50,7 +65,7 @@ Semantic caching (local ONNX embeddings) is on out of the box — the model and 
 
 ### Building from source (contributors)
 
-If you're changing the Rust code, layer on the build override to compile locally instead of pulling:
+To run the latest repository code, including Responses tools, Anthropic strict mapping, and 15% shadow sampling, use the build override. The default Compose service references the published `0.6.3` image; these source changes have not been verified as included in that image.
 
 ```bash
 docker compose -f docker-compose.yml -f docker-compose.build.yml up --build
@@ -103,7 +118,7 @@ Migration 011 backfills existing keys with their own hash as the organization ID
 | `MAX_SPEND_CENTS_PER_CLIENT`    | no       | 5000          | Per-client spend cap (cents) per window                             |
 | `SPEND_GUARD_WINDOW_SECS`       | no       | 3600          | SpendGuard rolling window, in seconds                               |
 | `MAX_CONCURRENT_PROVIDER_CALLS` | no       | 200           | Caps simultaneous in-flight provider calls                          |
-| `SHADOW_SAMPLE_PERCENT` | no | **15** | Percentage of eligible shadow requests sampled (0?100); invalid values disable sampling |
+| `SHADOW_SAMPLE_PERCENT` | no | **15** | Percentage of eligible shadow requests sampled (0-100); invalid values disable sampling |
 | `ENABLE_SHADOW_MODE`            | no       | **true**      | Enables shadow-mode A/B comparison calls — on by default; set to `false` to disable |
 | `TELEMETRY_OUTPUT_DIR`          | no       | `./telemetry` | Where telemetry JSONL files are written                             |
 | `TELEMETRY_BUFFER_SIZE`         | no       | 500           | Records buffered before a telemetry flush                           |
@@ -159,6 +174,9 @@ RouterFuel is pure BYOK — you supply your own keys per provider via request he
 
 ```
 src/
+  responses.rs             - plain-text Responses function turns + reasoning replay
+  responses_stream.rs      - Responses SSE to chat-completion SSE translation
+  shadow_policy.rs         - 15% sampling and cheaper-cost admission
   main.rs                 — HTTP server, routing glue, request handlers
   connectors.rs            — per-provider HTTP clients (Anthropic, Gemini, Azure OpenAI, Bedrock, OpenAI-compatible)
   route_engine.rs           — model registry + routing decisions
