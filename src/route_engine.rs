@@ -501,6 +501,14 @@ impl RouteEngine {
                 cost_in: 300.0, cost_out: 1500.0, latency_ms: 170, quality: 0.942, context: 1_000_000,
                 vision: true, open_weight: false, enabled: true),
 
+            // Official model overview/pricing: 1M context and image input.
+            // $0.10/$0.50 per MTok through 100K input, then $0.50/$2.50.
+            // Latency and quality are routing priors, not live measurements.
+            model!(api_id: "claude-haiku-5-5", display_name: "Claude Haiku 5.5", provider: Provider::Anthropic,
+                cost_in: 10.0, cost_out: 50.0, latency_ms: 90, quality: 0.825, context: 1_000_000,
+                vision: true, open_weight: false, enabled: true,
+                tier: PriceTier { above_input_tokens: 100_000, input_mult: 5.0, output_mult: 5.0 }),
+
             model!(api_id: "claude-haiku-4-5", display_name: "Claude Haiku 4.5", provider: Provider::Anthropic,
                 cost_in: 100.0, cost_out: 500.0, latency_ms: 90, quality: 0.803, context: 200_000,
                 vision: true, open_weight: false, enabled: true),
@@ -1370,6 +1378,7 @@ pub fn openrouter_slug_override(direct_api_id: &str) -> Option<&'static str> {
         // grok-4.6 needs no entry either — its direct api_id already
         // carries the dot, so the formula yields the correct
         // "x-ai/grok-4.6".
+        "claude-haiku-5-5" => Some("anthropic/claude-haiku-5.5"),
         "claude-fable-5-1" => Some("anthropic/claude-fable-5.1"),
         "llama-3.1-8b-instant" => Some("meta-llama/llama-3.1-8b-instruct"),
         "llama-3.3-70b-versatile" => Some("meta-llama/llama-3.3-70b-instruct"),
@@ -1638,6 +1647,18 @@ mod tests {
         assert_eq!(grok.provider, Provider::XAI);
         assert_eq!(grok.context_window, 500_000);
         assert_eq!(e.get_pricing("grok-4.6").unwrap(), (200.0, 600.0));
+    }
+
+    #[test]
+    fn haiku_5_5_registration_pricing_boundary_and_openrouter_route() {
+        let e = RouteEngine::new();
+        let model = e.find("claude-haiku-5-5").unwrap();
+        assert_eq!(model.provider, Provider::Anthropic);
+        assert!(model.enabled && model.supports_vision);
+        assert_eq!(model.context_window, 1_000_000);
+        assert_eq!(e.get_pricing_for("claude-haiku-5-5", 100_000).unwrap(), (10.0, 50.0));
+        assert_eq!(e.get_pricing_for("claude-haiku-5-5", 100_001).unwrap(), (50.0, 250.0));
+        assert_eq!(openrouter_slug_override("claude-haiku-5-5"), Some("anthropic/claude-haiku-5.5"));
     }
 
     #[test]
