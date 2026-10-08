@@ -535,9 +535,9 @@ impl RouteEngine {
             //
             // 1. Astra is enabled for Chat Completions requests. OpenAI's
             //    current model page lists this endpoint and the model ID.
-            //    Chat tool requests are rejected until RouterFuel supports
-            //    its Responses-API tool path; BYOK account access is not
-            //    established by a public catalog entry.
+            //    Tool turns use the Responses adapter; its protocol tests
+            //    use mocks. BYOK account access is not established by a
+            //    public catalog entry.
             //
             // 2. The cost figures below are OpenAI's SHORT-context rates, and
             //    `tier` now carries the long-context break that ModelConfig
@@ -576,8 +576,8 @@ impl RouteEngine {
 
             // OpenAI's 2026-09 model catalog: $2/$10, 1.05M total context,
             // 922K max input. Use the lower limit as the routing-safe bound.
-            // Chat Completions supports this model, but tool calls require
-            // Responses API and are rejected on RouterFuel's direct path.
+            // Chat Completions supports this model; function tool turns
+            // use RouterFuel's mock-tested Responses adapter.
             model!(api_id: "gpt-6.1-sol", display_name: "GPT-6.1 Sol", provider: Provider::OpenAI,
                 cost_in: 200.0, cost_out: 1000.0, latency_ms: 250, quality: 0.985, context: 922_000,
                 vision: true, open_weight: false, enabled: true,

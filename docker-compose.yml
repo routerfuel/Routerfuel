@@ -57,6 +57,7 @@ services:
       ROUTERFUEL_CLIENT_TIERS: ${ROUTERFUEL_CLIENT_TIERS:-}
       ROUTERFUEL_ADMIN_KEY: ${ROUTERFUEL_ADMIN_KEY:-}
       ENABLE_SHADOW_MODE: ${ENABLE_SHADOW_MODE:-true}
+      SHADOW_SAMPLE_PERCENT: ${SHADOW_SAMPLE_PERCENT:-15}
 
       # How often to re-read the client_tiers table, in seconds. Unset is
       # fine — main.rs falls back to client_registry::DEFAULT_SYNC_INTERVAL_SECS

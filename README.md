@@ -21,7 +21,7 @@ RouterFuel never holds a billable key of its own. Every request is billed to *yo
 - **Stable organization identity** — a database-provisioned `organization_id` can group multiple client keys so request logs stay associated with one tenant across key rotation; existing and env-only keys retain their individual key hash as the default identity
 - **Concurrency limiting** — bounds in-flight provider calls so a traffic spike doesn't get you rate-limited or IP-blocked upstream
 - **Guardrails** — LoopGuard flags a client stuck retrying the same prompt; SpendGuard hard-caps per-client spend in a rolling window
-- **Shadow-mode A/B testing** — fire a second, comparison-only call at a different model alongside the real one, without affecting what the client receives. **Enabled by default** — any client can trigger it by sending `shadow_model` on a request, and it bills a second real call to their BYOK key
+- **Shadow-mode A/B testing** ? clients request a comparison with `shadow_model`; the gateway samples 15% of eligible successful non-streaming requests by default. Only a strictly cheaper estimated shadow call is admitted, with its own spend reservation. Each executed shadow call bills the customer's BYOK account. Sampling does not run on streaming or cache-hit requests.
 - **Streaming** — SSE streaming for Anthropic, Gemini, Azure OpenAI, and OpenAI-compatible providers. Bedrock's legacy streaming path has not been migrated to Converse/SigV4 and is not verified against AWS; do not rely on it.
 - **Admin dashboard** — a self-hosted, no-build-step web UI at `/admin/dashboard` visualizing spend, cache performance, per-model and per-client cost, the request timeline, rate-limit tiers, and shadow-mode comparisons — reads the `/admin/*` endpoints below in real time. The dashboard *page* itself is public; the data endpoints it calls each require `X-Admin-Key`
 - **Cursor integration** — point Cursor's custom OpenAI-compatible model settings straight at RouterFuel and route your editor's requests through your own provider keys
@@ -103,6 +103,7 @@ Migration 011 backfills existing keys with their own hash as the organization ID
 | `MAX_SPEND_CENTS_PER_CLIENT`    | no       | 5000          | Per-client spend cap (cents) per window                             |
 | `SPEND_GUARD_WINDOW_SECS`       | no       | 3600          | SpendGuard rolling window, in seconds                               |
 | `MAX_CONCURRENT_PROVIDER_CALLS` | no       | 200           | Caps simultaneous in-flight provider calls                          |
+| `SHADOW_SAMPLE_PERCENT` | no | **15** | Percentage of eligible shadow requests sampled (0?100); invalid values disable sampling |
 | `ENABLE_SHADOW_MODE`            | no       | **true**      | Enables shadow-mode A/B comparison calls — on by default; set to `false` to disable |
 | `TELEMETRY_OUTPUT_DIR`          | no       | `./telemetry` | Where telemetry JSONL files are written                             |
 | `TELEMETRY_BUFFER_SIZE`         | no       | 500           | Records buffered before a telemetry flush                           |

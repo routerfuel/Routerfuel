@@ -501,7 +501,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mock_http_stream_completes_tool_result_cycle_and_rejects_strict() {
+    async fn mock_http_stream_completes_strict_tool_result_cycle() {
         use axum::{body::Body, routing::post, Router};
         use parking_lot::Mutex;
         use std::sync::Arc;
@@ -541,7 +541,7 @@ mod tests {
         let url = format!("http://{address}/v1/messages");
         let mut request: ChatCompletionRequest = serde_json::from_value(json!({
             "model":"claude-test", "stream":true, "messages":[{"role":"user","content":"Book noon"}],
-            "tools":[{"type":"function","function":{"name":"book","parameters":{"type":"object","properties":{"slot":{"type":"string"}}}}}]
+            "tools":[{"type":"function","function":{"name":"book","strict":true,"parameters":{"type":"object","properties":{"slot":{"type":"string"}},"required":["slot"],"additionalProperties":false}}}]
         })).unwrap();
         let first_body = anthropic_stream_body(&request).unwrap();
         let (first, done) =
@@ -572,9 +572,11 @@ mod tests {
             seen.lock()[1]["messages"][2]["content"][0]["tool_use_id"],
             "call_1"
         );
-        request.tools.as_mut().unwrap()[0]["function"]["strict"] = json!(true);
-        let error = validate_anthropic_tool_request(&request).unwrap_err();
-        assert!(error.contains("Strict-mode tool schemas aren't supported"));
-        assert!(anthropic_stream_body(&request).is_err());
+        assert!(validate_anthropic_tool_request(&request).is_ok());
+        let captured = seen.lock();
+        for body in captured.iter() {
+            assert_eq!(body["tools"][0]["strict"], true);
+            assert_eq!(body["tools"][0]["input_schema"]["additionalProperties"], false);
+        }
     }
 }
