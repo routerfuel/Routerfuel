@@ -437,6 +437,17 @@ macro_rules! model {
 }
 
 impl RouteEngine {
+    pub async fn refresh_measurements(&self, pool: &sqlx::PgPool) -> Result<()> {
+        use sqlx::Row;
+        let rows=sqlx::query("SELECT model_name,percentile_cont(0.5) WITHIN GROUP(ORDER BY latency_ms)::float8 AS latency,count(*) AS n FROM request_logs WHERE status='success' AND from_cache=false AND latency_ms IS NOT NULL AND created_at>now()-interval '7 days' GROUP BY model_name HAVING count(*)>=20").fetch_all(pool).await?;
+        let quality=sqlx::query("SELECT model,avg(score)::float8 AS score FROM (SELECT c.primary_model AS model,f.primary_score AS score FROM shadow_quality_feedback f JOIN shadow_comparisons c USING(request_id) WHERE f.created_at>now()-interval '7 days' UNION ALL SELECT c.shadow_model,f.shadow_score FROM shadow_quality_feedback f JOIN shadow_comparisons c USING(request_id) WHERE f.created_at>now()-interval '7 days') scores WHERE score IS NOT NULL GROUP BY model HAVING count(*)>=20").fetch_all(pool).await?;
+        let mut models=self.models.write();
+        let priors=Self::build_registry();
+        for model in models.iter_mut(){if let Some(prior)=priors.iter().find(|p|p.api_id==model.api_id){model.latency_ms=prior.latency_ms;model.quality_score=prior.quality_score;}}
+        for row in rows {let id:String=row.get("model_name");let latency:f64=row.get("latency");if let Some(m)=models.iter_mut().find(|m|m.api_id==id){m.latency_ms=latency.max(1.0) as u64;}}
+        for row in quality {let id:String=row.get("model");let score:f64=row.get("score");if let Some(m)=models.iter_mut().find(|m|m.api_id==id){m.quality_score=score.clamp(0.0,1.0) as f32;}}
+        Ok(())
+    }
     pub fn new() -> Self {
         Self {
             models: RwLock::new(Self::build_registry()),

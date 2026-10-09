@@ -31,3 +31,11 @@ OpenAI `function.strict` now maps to Anthropic tool-level `strict` in streaming 
 ## Shadow admission
 
 Shadow requests default to 15% probabilistic sampling (`SHADOW_SAMPLE_PERCENT`, 0?100; invalid values disable sampling). Only successful non-streaming requests that specify `shadow_model` are eligible. Sample before reserving spend, and admit only a strictly cheaper estimated call using known tier-aware prices and a common output-token estimate. Tool formats must validate before calling. Actual output costs can differ; output length is not a quality evaluation.
+
+## Reports, fallback and measured routing
+
+Migration 013 stores editable report frequency, quality feedback and scheduled reports. BYOK judging is explicit per request through `X-RouterFuel-Shadow-Judge-Model`; never treat output length as quality. Admin feedback requires the admin key. Reports use UTC and expose evaluated and unevaluated counts separately.
+
+Non-streaming transient failures can attempt at most two reachable compatible fallback models; no retries on invalid credentials, unmappable payloads, or ambiguous timeouts. Do not cache fallback answers under the requested model. Provider failures may have unknown billed usage; keep conservative reservations where appropriate.
+
+Measured routing aggregates seven-day latency and quality with a 20-sample minimum and resets to priors when evidence expires. This is cross-workload operational scoring, not a universal quality benchmark. Live judge and production failover verification remain pending.

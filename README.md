@@ -42,8 +42,9 @@ Sources: [Anthropic models](https://platform.claude.com/docs/en/about-claude/mod
 The Rust unit and mock-provider suite passed all 190 tests after the Responses, Anthropic strict-tool, shadow-sampling, and Haiku 5.5 changes. Mock tests verify gateway behavior; they do not establish live provider compatibility or model quality.
 
 - Shadow mode samples approximately 15% of eligible successful non-streaming requests that specify `shadow_model`. This is probabilistic, not an exact daily quota. Unknown prices, failed token estimates, non-cheaper candidates, and incompatible tool formats skip the call before spend reservation. Actual output lengths can differ, so a cheaper estimate does not guarantee a cheaper final bill.
-- `/admin/shadow` compares cost, latency, output length, and errors. It does not evaluate whether an answer matched, improved, or degraded quality. End-of-day quality evaluation and JSON-schema prompt adaptation remain planned.
-- Routing quality and latency values are configured estimates, not learned production outcomes. Circuit breakers are implemented; automatic retry/fallback to a second model and deployment-pool failover remain planned.
+- `/admin/shadow` compares cost, latency, output length, and errors. Quality reports use explicit admin feedback or an opt-in BYOK judge via `X-RouterFuel-Shadow-Judge-Model`. Scheduled reports distinguish matched/better/worse, failures and unevaluated comparisons. JSON-schema prompt adaptation remains planned.
+- Routing refreshes seven-day measured median latency and evaluated quality scores every minute once a model has at least 20 eligible samples. Cold-start models retain configured priors. Scores aggregate across gateway clients and workloads; they are operational estimates, not benchmarks.
+- Non-streaming transient provider failures can automatically fall back to at most two other reachable, context/vision/tool-compatible models. Authentication, malformed responses and unsupported inputs do not trigger fallback. Streaming does not switch providers after output. Deployment pools remain planned.
 - Live Bedrock and Vertex tool verification is pending. Streaming tool translation for Gemini, Vertex, and Bedrock remains unsupported.
 - LiveKit with OpenAI speech APIs is the selected first voice integration; voice transport, MCP permissions, conversation/outcome accounting, and outcome-based optimization are not shipped.
 
@@ -218,3 +219,17 @@ env.example                 — copy to .env before `docker compose up`
 ## License
 
 This project is licensed under the GNU Affero General Public License v3.0 (AGPL-3.0) - see the [LICENSE](https://github.com/routerfuel/Routerfuel/blob/main/LICENSE) file for details.
+
+## Scheduled shadow quality reports
+
+The Shadow mode dashboard lets admins set `never`, hourly, daily (default), weekly, biweekly (every two weeks), monthly, quarterly or yearly report frequency. Settings persist in Postgres and apply without a restart. Reports use UTC boundaries, generate while the gateway runs, and are stored for retrieval; no email or external delivery is configured. Monthly/quarterly/yearly use calendar intervals. Missed runs produce one catch-up report rather than duplicates.
+
+Admin endpoints (all require `X-Admin-Key`):
+
+- `GET /admin/shadow/settings` and `PUT /admin/shadow/settings` with `{"frequency":"weekly"}`.
+- `GET /admin/shadow/reports` returns the latest 100 stored reports.
+- `POST /admin/shadow/feedback` with `request_id`, `verdict` (`matched`, `better`, `worse`) and optional `primary_score`/`shadow_score` from 0 to 1. Only successful stored shadow comparisons can receive feedback.
+
+For automatic judging, send `X-RouterFuel-Shadow-Judge-Model: claude-haiku-5-5` with a shadow request and the customer's provider key. This explicitly authorizes sending the task messages and both answers to that judge. Evaluation adds a real BYOK charge and uses its own spend reservation. No judge runs without that header. Invalid/failed evaluation stays unevaluated; a judge's score is an estimate, not ground truth. Reports show observed potential token savings for matched/better comparisons and separate experiment spend including successful judge calls. Savings are not extrapolated to all traffic.
+
+Automatic fallback uses supplied provider credentials and can change provider/model. Failed attempts can have unknown upstream usage; conservative estimates remain reserved when appropriate. A fallback response is not cached under the originally requested model. Rebuild from source to test these changes. Migration 013 adds report settings, feedback and stored reports.
