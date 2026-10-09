@@ -32,5 +32,8 @@ None of the unchecked items above should be described as available APIs.
 
 - [x] Sample approximately 15% of eligible successful non-streaming requests that specify `shadow_model`; configurable with `SHADOW_SAMPLE_PERCENT`.
 - [x] Admit only strictly cheaper estimated shadow calls, using tier-aware pricing and a common output-token estimate; skip unknown pricing and incompatible tool requests.
-- [ ] End-of-day evaluated shadow quality report (matched/worse/better) and savings.
+- [x] Stored scheduled shadow quality reports with editable frequency, explicit feedback and opt-in BYOK judge. Live-provider evaluation remains unverified.
 - [ ] Narrow JSON-schema prompt adaptation for cheaper models.
+
+- [x] Bounded automatic compatible-model fallback for non-streaming transient failures; production outage verification remains pending.
+- [x] Seven-day measured latency/quality refresh after at least 20 samples per model, with cold-start priors.

@@ -134,6 +134,7 @@ pub struct ShadowComparison {
 }
 
 impl CostTracker {
+    pub fn pool(&self) -> &PgPool { self.pool.as_ref() }
     pub fn new(pool: PgPool) -> Self {
         Self {
             pool: Arc::new(pool),

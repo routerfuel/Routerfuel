@@ -321,6 +321,14 @@
   </div>
 
   <div class="tabpage" id="page-shadow">
+    <div class="panel">
+      <label for="shadowFrequency">Quality report frequency</label>
+      <select id="shadowFrequency"><option>never</option><option>hourly</option><option selected>daily</option><option>weekly</option><option value="biweekly">every two weeks</option><option>monthly</option><option>quarterly</option><option>yearly</option></select>
+      <button id="saveShadowFrequency">Save frequency</button>
+      <span id="shadowScheduleStatus" role="status"></span>
+      <p>Quality is evaluated only for opted-in requests. Reports retain unevaluated comparisons separately.</p>
+      <div id="shadowQualityReports"></div>
+    </div>
     <div class="panel" style="margin-bottom:0;">
       <table>
         <thead><tr><th>Primary → Shadow</th><th class="num-cell">Comparisons</th><th class="num-cell">Avg cost Δ</th><th class="num-cell">Avg latency Δ</th><th class="num-cell">Error rate</th></tr></thead>
@@ -329,7 +337,7 @@
     </div>
   </div>
 
-  <div class="footer-note">RouterFuel Admin · reads only, no writes performed by this page</div>
+  <div class="footer-note">RouterFuel Admin · report frequency can be edited with your admin key</div>
 </div>
 
 <script>
@@ -540,7 +548,19 @@ async function loadRateLimits(){
     </tr>`).join('') : `<tr class="empty-row"><td colspan="3">No registered clients seen yet</td></tr>`;
 }
 
+$('saveShadowFrequency').addEventListener('click', async () => {
+  try {
+    const response = await fetch(BASE.replace(/\/$/, '') + '/admin/shadow/settings', {method:'PUT',headers:{'X-Admin-Key':KEY,'Content-Type':'application/json'},body:JSON.stringify({frequency:$('shadowFrequency').value})});
+    if (!response.ok) throw new Error('Could not save frequency');
+    $('shadowScheduleStatus').textContent='Saved'; await loadShadow();
+  } catch(error) { $('shadowScheduleStatus').textContent=error.message; }
+});
 async function loadShadow(){
+  const settings=await api('/admin/shadow/settings');
+  $('shadowFrequency').value=settings.frequency;
+  $('shadowScheduleStatus').textContent=settings.frequency==='never'?'Reports disabled':'Next report: '+settings.next_run_at;
+  const reports=await api('/admin/shadow/reports');
+  $('shadowQualityReports').innerHTML=reports.length?reports.slice(0,5).map(r=>`<details><summary>${esc(r.from)} to ${esc(r.to)}</summary><pre>${esc(JSON.stringify(r.report,null,2))}</pre></details>`).join(''):'No scheduled reports generated yet.';
   const from = $('fromDate').value, to = $('toDate').value;
   const rows = await api('/admin/shadow', { from, to });
   $('tblShadow').innerHTML = rows.length ? rows.map(r => {
