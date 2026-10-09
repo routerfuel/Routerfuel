@@ -6,14 +6,6 @@ A BYOK (Bring Your Own Key) AI gateway written in Rust. RouterFuel sits between 
 
 RouterFuel never holds a billable key of its own. Every request is billed to *your* provider account, using *your* key. RouterFuel's job is just to route it well, cache it when it can, and tell you what it cost.
 
-## Claude Haiku 5.5
-
-Use `"model": "claude-haiku-5-5"` with your Anthropic BYOK key. RouterFuel registers its 1M-token context and image-input capability. The OpenRouter fallback maps to `anthropic/claude-haiku-5.5`.
-
-Standard token estimates use $0.10 input / $0.50 output per million tokens for prompts up to 100,000 input tokens, and $0.50 / $2.50 above that threshold. These are token rates, not a fixed request price; prompt-cache and other provider billing adjustments are not modeled here. Latency and quality remain configured routing estimates. The entry is documentation/catalog verified, not live-provider verified.
-
-Sources: [Anthropic models](https://platform.claude.com/docs/en/about-claude/models/overview) and [pricing](https://platform.claude.com/docs/en/about-claude/pricing).
-
 ## Features
 
 - **Smart routing** — pick a model by name, let RouterFuel auto-select using cost and configured latency/quality estimates, or route by task type (`task:summarize`, `task:extract_action_items`, `task:draft_response`, `task:answer_question`, `task:classify`)
